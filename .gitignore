@@ -1,0 +1,7 @@
+old/
+obj/*
+data/*
+*.sh
+*.txt
+cut.py
+main
