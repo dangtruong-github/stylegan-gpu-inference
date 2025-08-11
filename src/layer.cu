@@ -9,143 +9,82 @@
 #define TILE_W_IM2COL 16
 #define NUM_THREADS_MAT_MUL 64
 
-void mat_mul(float *A, float *B, float *C, int M, int N, int K) {
-  #pragma omp parallel num_threads(NUM_THREADS_MAT_MUL)
-  {
-    int tid = omp_get_thread_num();
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    CPU_SET(tid, &cpuset);
-    sched_setaffinity(0, sizeof(cpu_set_t), &cpuset);
+// --- CUDA Kernel for Matrix Multiplication ---
+// This kernel remains unchanged. It operates on the data pointers it's given.
+// The logic of which GPU it runs on is handled by the host.
+__global__ void matmul_kernel(const float *A, const float *B, float *C, int M, int N, int K) {
+  int row = blockIdx.y * blockDim.y + threadIdx.y;
+  int col = blockIdx.x * blockDim.x + threadIdx.x;
 
-    for (int k0 = 0; k0 < K; k0 += KTILE) {
-    #pragma omp for collapse(2)
-      for (int i0 = 0; i0 < M; i0 += ITILE) {
-        for (int j0 = 0; j0 < N; j0 += JTILE) {
-
-          const int iend = min(M, i0 + ITILE);
-          const int jend = min(N, j0 + JTILE);
-          const int kend = min(K, k0 + KTILE);
-
-          for (int ii = i0; ii < iend; ii += 8) {
-            for (int jj = j0; jj < jend; jj += 16) {
-
-              __m256 c00, c01, c10, c11, c20, c21, c30, c31;
-              __m256 c40, c41, c50, c51, c60, c61, c70, c71;
-
-              if (k0 == 0) {
-                c00 = c01 = c10 = c11 = c20 = c21 = c30 = c31 =
-                    _mm256_setzero_ps();
-                c40 = c41 = c50 = c51 = c60 = c61 = c70 = c71 =
-                    _mm256_setzero_ps();
-              } else {
-                c00 = _mm256_load_ps(&C[(ii + 0) * N + jj + 0]);
-                c01 = _mm256_load_ps(&C[(ii + 0) * N + jj + 8]);
-                c10 = _mm256_load_ps(&C[(ii + 1) * N + jj + 0]);
-                c11 = _mm256_load_ps(&C[(ii + 1) * N + jj + 8]);
-                c20 = _mm256_load_ps(&C[(ii + 2) * N + jj + 0]);
-                c21 = _mm256_load_ps(&C[(ii + 2) * N + jj + 8]);
-                c30 = _mm256_load_ps(&C[(ii + 3) * N + jj + 0]);
-                c31 = _mm256_load_ps(&C[(ii + 3) * N + jj + 8]);
-                c40 = _mm256_load_ps(&C[(ii + 4) * N + jj + 0]);
-                c41 = _mm256_load_ps(&C[(ii + 4) * N + jj + 8]);
-                c50 = _mm256_load_ps(&C[(ii + 5) * N + jj + 0]);
-                c51 = _mm256_load_ps(&C[(ii + 5) * N + jj + 8]);
-                c60 = _mm256_load_ps(&C[(ii + 6) * N + jj + 0]);
-                c61 = _mm256_load_ps(&C[(ii + 6) * N + jj + 8]);
-                c70 = _mm256_load_ps(&C[(ii + 7) * N + jj + 0]);
-                c71 = _mm256_load_ps(&C[(ii + 7) * N + jj + 8]);
-              }
-
-              // Vòng lặp tích lũy theo chiều K
-              for (int kk = k0; kk < kend; ++kk) {
-                // Nạp 2 vector từ B và tái sử dụng cho cả 8 hàng C
-                const __m256 b0 = _mm256_loadu_ps(&B[kk * N + jj + 0]);
-                const __m256 b1 = _mm256_loadu_ps(&B[kk * N + jj + 8]);
-
-                // Hàng 0
-                __m256 a_broadcast = _mm256_set1_ps(A[(ii + 0) * K + kk]);
-                c00 = _mm256_fmadd_ps(a_broadcast, b0, c00);
-                c01 = _mm256_fmadd_ps(a_broadcast, b1, c01);
-
-                // Hàng 1
-                a_broadcast = _mm256_set1_ps(A[(ii + 1) * K + kk]);
-                c10 = _mm256_fmadd_ps(a_broadcast, b0, c10);
-                c11 = _mm256_fmadd_ps(a_broadcast, b1, c11);
-
-                // Hàng 2
-                a_broadcast = _mm256_set1_ps(A[(ii + 2) * K + kk]);
-                c20 = _mm256_fmadd_ps(a_broadcast, b0, c20);
-                c21 = _mm256_fmadd_ps(a_broadcast, b1, c21);
-
-                // Hàng 3
-                a_broadcast = _mm256_set1_ps(A[(ii + 3) * K + kk]);
-                c30 = _mm256_fmadd_ps(a_broadcast, b0, c30);
-                c31 = _mm256_fmadd_ps(a_broadcast, b1, c31);
-
-                // Hàng 4
-                a_broadcast = _mm256_set1_ps(A[(ii + 4) * K + kk]);
-                c40 = _mm256_fmadd_ps(a_broadcast, b0, c40);
-                c41 = _mm256_fmadd_ps(a_broadcast, b1, c41);
-
-                // Hàng 5
-                a_broadcast = _mm256_set1_ps(A[(ii + 5) * K + kk]);
-                c50 = _mm256_fmadd_ps(a_broadcast, b0, c50);
-                c51 = _mm256_fmadd_ps(a_broadcast, b1, c51);
-
-                // Hàng 6
-                a_broadcast = _mm256_set1_ps(A[(ii + 6) * K + kk]);
-                c60 = _mm256_fmadd_ps(a_broadcast, b0, c60);
-                c61 = _mm256_fmadd_ps(a_broadcast, b1, c61);
-
-                // Hàng 7
-                a_broadcast = _mm256_set1_ps(A[(ii + 7) * K + kk]);
-                c70 = _mm256_fmadd_ps(a_broadcast, b0, c70);
-                c71 = _mm256_fmadd_ps(a_broadcast, b1, c71);
-              }
-
-              // Ghi kết quả ra bộ nhớ chỉ MỘT LẦN sau khi tích lũy xong
-              _mm256_storeu_ps(&C[(ii + 0) * N + jj + 0], c00);
-              _mm256_storeu_ps(&C[(ii + 0) * N + jj + 8], c01);
-              _mm256_storeu_ps(&C[(ii + 1) * N + jj + 0], c10);
-              _mm256_storeu_ps(&C[(ii + 1) * N + jj + 8], c11);
-              _mm256_storeu_ps(&C[(ii + 2) * N + jj + 0], c20);
-              _mm256_storeu_ps(&C[(ii + 2) * N + jj + 8], c21);
-              _mm256_storeu_ps(&C[(ii + 3) * N + jj + 0], c30);
-              _mm256_storeu_ps(&C[(ii + 3) * N + jj + 8], c31);
-              _mm256_storeu_ps(&C[(ii + 4) * N + jj + 0], c40);
-              _mm256_storeu_ps(&C[(ii + 4) * N + jj + 8], c41);
-              _mm256_storeu_ps(&C[(ii + 5) * N + jj + 0], c50);
-              _mm256_storeu_ps(&C[(ii + 5) * N + jj + 8], c51);
-              _mm256_storeu_ps(&C[(ii + 6) * N + jj + 0], c60);
-              _mm256_storeu_ps(&C[(ii + 6) * N + jj + 8], c61);
-              _mm256_storeu_ps(&C[(ii + 7) * N + jj + 0], c70);
-              _mm256_storeu_ps(&C[(ii + 7) * N + jj + 8], c71);
-            }
-          }
-        }
-      }
+  if (row < M && col < N) {
+    float C_value = 0.0f;
+    for (int k = 0; k < K; ++k) {
+      C_value += A[row * K + k] * B[k * N + col];
     }
+    C[row * N + col] = C_value;
   }
 }
 
-void bmm_wrapper(Tensor *A, Tensor *B, Tensor *C) {
-  const size_t batch_size = A->shape[0];
+// --- Host Function to Launch the Kernel ---
+// This function also remains unchanged. It simply configures and launches the kernel.
+void launch_matmul_kernel(const float *d_A, const float *d_B, float *d_C, int M, int N, int K) {
+  const int TILE_SIZE = 16;
+  dim3 blockDim(TILE_SIZE, TILE_SIZE);
+  dim3 gridDim((N + blockDim.x - 1) / blockDim.x, (M + blockDim.y - 1) / blockDim.y);
+
+  matmul_kernel<<<gridDim, blockDim>>>(d_A, d_B, d_C, M, N, K);
+  CHECK_CUDA(cudaGetLastError());
+}
+
+// --- Batched Matrix Multiplication Wrapper (Multi-GPU) ---
+// This function now orchestrates the operation across multiple GPUs.
+void bmm_wrapper(Tensor *A, Tensor *B, Tensor *C, cudaStream_t *streams) {
+  // 1. Move input data to the respective GPUs.
+  // to_device() handles splitting the data across all NUM_GPUS.
+  A->to_device(streams);
+  B->to_device(streams);
+
+  // 2. Get dimensions from tensor shapes
+  const size_t batch_per_gpu = A->shape[0] / NUM_GPUS;
   const size_t M = A->shape[1];
-  const size_t N = B->shape[2];
   const size_t K = A->shape[2];
+  const size_t N = B->shape[2];
+
+  // Calculate the number of elements per single matrix in the batch
   const size_t num_elem_A = M * K;
-  const size_t num_elem_B = N * K;
+  const size_t num_elem_B = K * N;
   const size_t num_elem_C = M * N;
 
-  float *cur_A = A->buf, *cur_B = B->buf, *cur_C = C->buf;
+  // 3. Loop over each GPU and launch kernels for its portion of the batch
+  for (int gpu_id = 0; gpu_id < NUM_GPUS; ++gpu_id) {
+    // Set the active GPU for the following CUDA calls
+    CHECK_CUDA(cudaSetDevice(gpu_id));
 
-  for (size_t b = 0; b < batch_size; ++b) {
-    mat_mul(cur_A, cur_B, cur_C, M, N, K);
-    cur_A += num_elem_A;
-    cur_B += num_elem_B;
-    cur_C += num_elem_C;
+    // Get base pointers to device memory for the current GPU
+    float *base_A_d = A->d_buf[gpu_id];
+    float *base_B_d = B->d_buf[gpu_id];
+    float *base_C_d = C->d_buf[gpu_id];
+
+    // Loop over the sub-batch assigned to this GPU
+    for (size_t b = 0; b < batch_per_gpu; ++b) {
+      // Calculate pointers for the current matrix in the sub-batch
+      float *cur_A_d = base_A_d + b * num_elem_A;
+      float *cur_B_d = base_B_d + b * num_elem_B;
+      float *cur_C_d = base_C_d + b * num_elem_C;
+
+      // Launch the kernel for the current matrices on the current GPU
+      launch_matmul_kernel(cur_A_d, cur_B_d, cur_C_d, M, N, K);
+    }
   }
+  
+  // Synchronize all GPUs to ensure all computations are finished before copying back data
+  for (int gpu_id = 0; gpu_id < NUM_GPUS; ++gpu_id) {
+    CHECK_CUDA(cudaSetDevice(gpu_id));
+    CHECK_CUDA(cudaDeviceSynchronize());
+  }
+
+  // 4. Copy the final result from all GPUs back to the host CPU
+  C->from_device(streams);
 }
 
 /**
@@ -1068,7 +1007,7 @@ void Conv2d_Optimized(Tensor *input, Tensor *weight, Tensor *output) {
  * OW = (W + 2 * pad - dilation * (S - 1) - 1) / stride + 1
  * pad = 1, dilation = 1, stride = 1, R = S = 3
  */
-void Conv2d_im2col(Tensor *input, Tensor *weight, Tensor *output, Tensor *col_buffer) {
+void Conv2d_im2col(Tensor *input, Tensor *weight, Tensor *output, Tensor *col_buffer, cudaStream_t *streams) {
   // --- Timing variables ---
   double func_start_time = get_time_kernel();
   double start_time, end_time;
@@ -1113,7 +1052,7 @@ void Conv2d_im2col(Tensor *input, Tensor *weight, Tensor *output, Tensor *col_bu
   // Note that `col_buffer` is already in the correct format and can be used directly.
   // output_view = weight_view @ col_buffer
   start_time = get_time_kernel();
-  bmm_wrapper(weight, col_buffer, output);
+  bmm_wrapper(weight, col_buffer, output, streams);
   end_time = get_time_kernel();
   bmm_time = end_time - start_time;
 
@@ -1158,7 +1097,7 @@ void Conv2d_im2col(Tensor *input, Tensor *weight, Tensor *output, Tensor *col_bu
  * col_buffer (N, KRS, HW)
  */
 void ConvTranspose2d_col2im(Tensor *input, Tensor *weight, Tensor *output,
-                            Tensor *col_buffer) {
+                            Tensor *col_buffer, cudaStream_t *streams) {
   // --- Timing variables ---
   double func_start_time = get_time_kernel();
   double start_time, end_time;
@@ -1181,7 +1120,7 @@ void ConvTranspose2d_col2im(Tensor *input, Tensor *weight, Tensor *output,
   weight->reshape({N, (size_t)(K * R * S), C});
   input->reshape({N, C, (size_t)(H * W)});
   start_time = get_time_kernel();
-  bmm_wrapper(weight, input, col_buffer);
+  bmm_wrapper(weight, input, col_buffer, streams);
   end_time = get_time_kernel();
   bmm_time = end_time - start_time;
   input->reshape({N, C, H, W});
@@ -1396,7 +1335,7 @@ void upfir2d(Tensor *input, Tensor *kernel, Tensor *output,
 
 void ModulatedConv2d(Tensor *input, Tensor *style, Tensor *modulate_weight, Tensor *modulate_bias, Tensor *conv_weight, Tensor *kernel, Tensor *output,
                      Tensor *style_a, Tensor *weight_a, Tensor *demod_a, Tensor *col_buffer, Tensor *weight_transposed, Tensor *conv_a, Tensor *upsample_a, Tensor *conv2_a,
-                     bool demodulate, bool upsample, size_t padding, size_t up
+                     bool demodulate, bool upsample, size_t padding, size_t up, cudaStream_t *streams
 ) {
   // --- Timing variables ---
   double func_start_time = get_time_kernel();
@@ -1481,7 +1420,7 @@ void ModulatedConv2d(Tensor *input, Tensor *style, Tensor *modulate_weight, Tens
     transpose_time = end_time - start_time;
     
     start_time = get_time_kernel();
-    ConvTranspose2d_col2im(input, weight_transposed, conv_a, col_buffer);
+    ConvTranspose2d_col2im(input, weight_transposed, conv_a, col_buffer, streams);
     end_time = get_time_kernel();
     conv_transpose_time = end_time - start_time;
 
@@ -1499,7 +1438,7 @@ void ModulatedConv2d(Tensor *input, Tensor *style, Tensor *modulate_weight, Tens
     } else {
       conv_path_taken = "Conv2d_Optimized";
       if (input->shape[2] > 64) {
-        Conv2d_im2col(input, weight_a, output, col_buffer);
+        Conv2d_im2col(input, weight_a, output, col_buffer, streams);
       } else {
         Conv2d_Optimized(input, weight_a, output);
       }
@@ -1713,17 +1652,17 @@ void elemAdd(Tensor *inout, Tensor *addend) {
 }
 
 void StyledConv(Tensor *input, Tensor *style, Tensor *modulate_weight, Tensor *modulate_bias, Tensor *conv_weight, Tensor *conv_bias, Tensor *kernel, Tensor *noise, Tensor *output,
-                Tensor *style_a, Tensor *weight_a, Tensor *demod_a, Tensor *col_buffer, Tensor *weight_transposed, Tensor *conv_a, Tensor *upsample_a, Tensor *conv2_a, bool upsample, size_t padding) {
+                Tensor *style_a, Tensor *weight_a, Tensor *demod_a, Tensor *col_buffer, Tensor *weight_transposed, Tensor *conv_a, Tensor *upsample_a, Tensor *conv2_a, bool upsample, size_t padding, cudaStream_t *streams) {
   ModulatedConv2d(input, style, modulate_weight, modulate_bias, conv_weight, kernel, output,
                   style_a, weight_a, demod_a, col_buffer, weight_transposed, conv_a, upsample_a, conv2_a,
-                  true, upsample, padding, 1);
+                  true, upsample, padding, 1, streams);
   addNoiseBiasLeakyReLU(output, noise, conv_bias);
 }
 
 void ToRGB(Tensor *input, Tensor *skip, Tensor *style, Tensor *modulate_weight, Tensor *modulate_bias, Tensor *conv_weight, Tensor *conv_bias, Tensor *kernel, Tensor *output,
            Tensor *style_a, Tensor *weight_a, Tensor *col_buffer, Tensor *skip_upsample_a, Tensor *skip_conv_a, Tensor *skip_a) {
   ModulatedConv2d(input, style, modulate_weight, modulate_bias, conv_weight, kernel, output,
-                  style_a, weight_a, col_buffer, nullptr, nullptr, nullptr, nullptr, nullptr, false, false, 0, 2);
+                  style_a, weight_a, nullptr, col_buffer, nullptr, nullptr, nullptr, nullptr, false, false, 0, 2, nullptr);
   addBias(output, conv_bias);
 
   if (skip != nullptr) {

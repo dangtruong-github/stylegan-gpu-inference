@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <string>
 #include <cstring> // For memcpy and memset
+#include <cassert> // For assert
 #include <stdlib.h>  // For posix_memalign and free
 
 #include "half.hpp" /* for half on CPU ('half_cpu') */
@@ -12,7 +13,8 @@
 
 // Define the alignment boundary. 64 bytes is a good value for AVX/AVX-512.
 #define TENSOR_ALIGNMENT 64
-#define BATCH_SIZE 2
+#define BATCH_SIZE 8
+#define NUM_GPUS 4
 
 using std::vector;
 
@@ -36,12 +38,18 @@ double get_time_kernel();
 
 // #define FP16 /* [Advanced] Uncomment this line only for FP16 */
 
-
 /* [Tensor Structure] */
 struct Tensor {
   size_t ndim = 0;
   size_t shape[5] = {1, 1, 1, 1, 1};
   float *buf = nullptr;
+  float *d_buf[NUM_GPUS] = {};  // Device buffers for fp32 (one per GPU)
+  bool malloc_success = false;
+
+  #ifdef FP16
+    half *d_buf_fp16[NUM_GPUS] = {};  // Device buffers for fp16 (one per GPU)
+  #endif
+
 
   Tensor(const vector<size_t> &shape_);
   Tensor(const vector<size_t> &shape_, float *buf_);
@@ -55,6 +63,19 @@ struct Tensor {
   // Helper functions for aligned memory management
   void* aligned_alloc(size_t size);
   void aligned_free(void* ptr);
+
+  void malloc_device();
+  void to_device(cudaStream_t *streams);
+  void from_device(cudaStream_t *streams);
+  void free_device();
+
+#ifdef FP16
+  void malloc_device_fp16();
+  void to_device_fp16(cudaStream_t *streams);
+  void from_device_fp16(cudaStream_t *streams);
+  void free_device_fp16();
+#endif
+
 };
 
 typedef Tensor Parameter;

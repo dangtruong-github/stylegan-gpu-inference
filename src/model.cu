@@ -388,6 +388,165 @@ Activation *block0_trans_weight_transposed, *block1_trans_weight_transposed, *bl
 
 Activation *block0_trans_col_buffer, *block1_trans_col_buffer, *block2_trans_col_buffer, *block3_trans_col_buffer, *block4_trans_col_buffer, *block5_trans_col_buffer, *block6_trans_col_buffer;
 
+cudaStream_t streams[NUM_GPUS];
+
+void alloc_activations_new() {
+  conv1_col_buffer = new Activation({BATCH_SIZE, 512*3*3, 4*4});
+  block0_conv_col_buffer = new Activation({BATCH_SIZE, 512*3*3, 8*8});
+  block1_conv_col_buffer = new Activation({BATCH_SIZE, 512*3*3, 16*16});
+  block2_conv_col_buffer = new Activation({BATCH_SIZE, 512*3*3, 32*32});
+  block3_conv_col_buffer = new Activation({BATCH_SIZE, 512*3*3, 64*64});
+  block4_conv_col_buffer = new Activation({BATCH_SIZE, 256*3*3, 128*128});
+  block5_conv_col_buffer = new Activation({BATCH_SIZE, 128*3*3, 256*256});
+  block6_conv_col_buffer = new Activation({BATCH_SIZE, 64*3*3, 512*512});
+
+  block0_trans_weight_transposed = new Activation({BATCH_SIZE, 512, 3, 3, 512});
+  block1_trans_weight_transposed = new Activation({BATCH_SIZE, 512, 3, 3, 512});
+  block2_trans_weight_transposed = new Activation({BATCH_SIZE, 512, 3, 3, 512});
+  block3_trans_weight_transposed = new Activation({BATCH_SIZE, 512, 3, 3, 512});
+  block4_trans_weight_transposed = new Activation({BATCH_SIZE, 256, 3, 3, 512});
+  block5_trans_weight_transposed = new Activation({BATCH_SIZE, 128, 3, 3, 256});
+  block6_trans_weight_transposed = new Activation({BATCH_SIZE, 64, 3, 3, 128});
+
+  block0_trans_col_buffer = new Activation({BATCH_SIZE, 512*3*3, 4*4});
+  block1_trans_col_buffer = new Activation({BATCH_SIZE, 512*3*3, 8*8});
+  block2_trans_col_buffer = new Activation({BATCH_SIZE, 512*3*3, 16*16});
+  block3_trans_col_buffer = new Activation({BATCH_SIZE, 512*3*3, 32*32});
+  block4_trans_col_buffer = new Activation({BATCH_SIZE, 256*3*3, 64*64});
+  block5_trans_col_buffer = new Activation({BATCH_SIZE, 128*3*3, 128*128});
+  block6_trans_col_buffer = new Activation({BATCH_SIZE, 64*3*3, 256*256});
+
+  conv1_output_a->malloc_device();
+  block0_conv_output_a->malloc_device();
+  block1_conv_output_a->malloc_device();
+  block2_conv_output_a->malloc_device();
+  block3_conv_output_a->malloc_device();
+  block4_conv_output_a->malloc_device();
+  block5_conv_output_a->malloc_device();
+  block6_conv_output_a->malloc_device();
+
+  conv1_weight_a->malloc_device();
+  block0_conv_weight_a->malloc_device();
+  block1_conv_weight_a->malloc_device();
+  block2_conv_weight_a->malloc_device();
+  block3_conv_weight_a->malloc_device();
+  block4_conv_weight_a->malloc_device();
+  block5_conv_weight_a->malloc_device();
+  block6_conv_weight_a->malloc_device();
+
+  conv1_col_buffer->malloc_device();
+  block0_conv_col_buffer->malloc_device();
+  block1_conv_col_buffer->malloc_device();
+  block2_conv_col_buffer->malloc_device();
+  block3_conv_col_buffer->malloc_device();
+  block4_conv_col_buffer->malloc_device();
+  block5_conv_col_buffer->malloc_device();
+  block6_conv_col_buffer->malloc_device();
+
+  block0_conv_up_output_a->malloc_device();
+  block1_conv_up_output_a->malloc_device();
+  block2_conv_up_output_a->malloc_device();
+  block3_conv_up_output_a->malloc_device();
+  block4_conv_up_output_a->malloc_device();
+  block5_conv_up_output_a->malloc_device();
+  block6_conv_up_output_a->malloc_device();
+
+  block0_trans_weight_transposed->malloc_device();
+  block1_trans_weight_transposed->malloc_device();
+  block2_trans_weight_transposed->malloc_device();
+  block3_trans_weight_transposed->malloc_device();
+  block4_trans_weight_transposed->malloc_device();
+  block5_trans_weight_transposed->malloc_device();
+  block6_trans_weight_transposed->malloc_device();
+
+  block0_trans_col_buffer->malloc_device();
+  block1_trans_col_buffer->malloc_device();
+  block2_trans_col_buffer->malloc_device();
+  block3_trans_col_buffer->malloc_device();
+  block4_trans_col_buffer->malloc_device();
+  block5_trans_col_buffer->malloc_device();
+  block6_trans_col_buffer->malloc_device();
+
+  for (int i = 0; i < NUM_GPUS; ++i) {
+    // Select the current GPU. All subsequent CUDA calls will target this device.
+    CHECK_CUDA(cudaSetDevice(i));
+    // Create a stream for the current GPU
+    CHECK_CUDA(cudaStreamCreate(&streams[i]));
+  }
+}
+
+void free_activations_new() {
+  for (int i = 0; i < NUM_GPUS; ++i) {
+    CHECK_CUDA(cudaStreamDestroy(streams[i]));
+  }
+  conv1_output_a->free_device();
+  block0_conv_output_a->free_device();
+  block1_conv_output_a->free_device();
+  block2_conv_output_a->free_device();
+  block3_conv_output_a->free_device();
+  block4_conv_output_a->free_device();
+  block5_conv_output_a->free_device();
+  block6_conv_output_a->free_device();
+
+  conv1_weight_a->free_device();
+  block0_conv_weight_a->free_device();
+  block1_conv_weight_a->free_device();
+  block2_conv_weight_a->free_device();
+  block3_conv_weight_a->free_device();
+  block4_conv_weight_a->free_device();
+  block5_conv_weight_a->free_device();
+  block6_conv_weight_a->free_device();
+
+  conv1_col_buffer->free_device();
+  block0_conv_col_buffer->free_device();
+  block1_conv_col_buffer->free_device();
+  block2_conv_col_buffer->free_device();
+  block3_conv_col_buffer->free_device();
+  block4_conv_col_buffer->free_device();
+  block5_conv_col_buffer->free_device();
+  block6_conv_col_buffer->free_device();
+
+  block0_conv_up_output_a->free_device();
+  block1_conv_up_output_a->free_device();
+  block2_conv_up_output_a->free_device();
+  block3_conv_up_output_a->free_device();
+  block4_conv_up_output_a->free_device();
+  block5_conv_up_output_a->free_device();
+  block6_conv_up_output_a->free_device();
+
+  block0_conv_up_weight_a->free_device();
+  block1_conv_up_weight_a->free_device();
+  block2_conv_up_weight_a->free_device();
+  block3_conv_up_weight_a->free_device();
+  block4_conv_up_weight_a->free_device();
+  block5_conv_up_weight_a->free_device();
+  block6_conv_up_weight_a->free_device();
+
+  block0_trans_col_buffer->free_device();
+  block1_trans_col_buffer->free_device();
+  block2_trans_col_buffer->free_device();
+  block3_trans_col_buffer->free_device();
+  block4_trans_col_buffer->free_device();
+  block5_trans_col_buffer->free_device();
+  block6_trans_col_buffer->free_device();
+
+  delete conv1_col_buffer;
+  delete block0_conv_col_buffer; delete block1_conv_col_buffer;
+  delete block2_conv_col_buffer; delete block3_conv_col_buffer;
+  delete block4_conv_col_buffer; delete block5_conv_col_buffer;
+  delete block6_conv_col_buffer;
+  
+  delete block0_trans_weight_transposed; delete block1_trans_weight_transposed;
+  delete block2_trans_weight_transposed; delete block3_trans_weight_transposed;
+  delete block4_trans_weight_transposed; delete block5_trans_weight_transposed;
+  delete block6_trans_weight_transposed;
+
+  delete block0_trans_col_buffer; delete block1_trans_col_buffer;
+  delete block2_trans_col_buffer; delete block3_trans_col_buffer;
+  delete block4_trans_col_buffer; delete block5_trans_col_buffer;
+  delete block6_trans_col_buffer;
+}
+
 void alloc_activations() {
   printf("BATCH SIZE: %d\n", BATCH_SIZE);
   mlp0_a = new Activation({BATCH_SIZE, 512});
@@ -558,34 +717,13 @@ void alloc_activations() {
   block6_skip_a = new Activation({BATCH_SIZE, 3, 512, 512});
   block6_to_rgb_skip_upsample_a = new Activation({BATCH_SIZE, 3, 515, 515});
   block6_to_rgb_skip_conv_a = new Activation({BATCH_SIZE, 3, 512, 512});
-  
-  conv1_col_buffer = new Activation({BATCH_SIZE, 512*3*3, 4*4});
-  block0_conv_col_buffer = new Activation({BATCH_SIZE, 512*3*3, 8*8});
-  block1_conv_col_buffer = new Activation({BATCH_SIZE, 512*3*3, 16*16});
-  block2_conv_col_buffer = new Activation({BATCH_SIZE, 512*3*3, 32*32});
-  block3_conv_col_buffer = new Activation({BATCH_SIZE, 512*3*3, 64*64});
-  block4_conv_col_buffer = new Activation({BATCH_SIZE, 256*3*3, 128*128});
-  block5_conv_col_buffer = new Activation({BATCH_SIZE, 128*3*3, 256*256});
-  block6_conv_col_buffer = new Activation({BATCH_SIZE, 64*3*3, 512*512});
 
-  block0_trans_weight_transposed = new Activation({BATCH_SIZE, 512, 3, 3, 512});
-  block1_trans_weight_transposed = new Activation({BATCH_SIZE, 512, 3, 3, 512});
-  block2_trans_weight_transposed = new Activation({BATCH_SIZE, 512, 3, 3, 512});
-  block3_trans_weight_transposed = new Activation({BATCH_SIZE, 512, 3, 3, 512});
-  block4_trans_weight_transposed = new Activation({BATCH_SIZE, 256, 3, 3, 512});
-  block5_trans_weight_transposed = new Activation({BATCH_SIZE, 128, 3, 3, 256});
-  block6_trans_weight_transposed = new Activation({BATCH_SIZE, 64, 3, 3, 128});
-
-  block0_trans_col_buffer = new Activation({BATCH_SIZE, 512*3*3, 4*4});
-  block1_trans_col_buffer = new Activation({BATCH_SIZE, 512*3*3, 8*8});
-  block2_trans_col_buffer = new Activation({BATCH_SIZE, 512*3*3, 16*16});
-  block3_trans_col_buffer = new Activation({BATCH_SIZE, 512*3*3, 32*32});
-  block4_trans_col_buffer = new Activation({BATCH_SIZE, 256*3*3, 64*64});
-  block5_trans_col_buffer = new Activation({BATCH_SIZE, 128*3*3, 128*128});
-  block6_trans_col_buffer = new Activation({BATCH_SIZE, 64*3*3, 256*256});
+  alloc_activations_new();
 }
 
 void free_activations() {
+  free_activations_new();
+
   delete mlp0_a;
   delete mlp1_a;
   delete mlp2_a;
@@ -669,22 +807,6 @@ void free_activations() {
   delete block6_to_rgb_output_a;
   delete block6_skip_a;
   delete block6_to_rgb_skip_upsample_a; delete block6_to_rgb_skip_conv_a;
-
-  delete conv1_col_buffer;
-  delete block0_conv_col_buffer; delete block1_conv_col_buffer;
-  delete block2_conv_col_buffer; delete block3_conv_col_buffer;
-  delete block4_conv_col_buffer; delete block5_conv_col_buffer;
-  delete block6_conv_col_buffer;
-  
-  delete block0_trans_weight_transposed; delete block1_trans_weight_transposed;
-  delete block2_trans_weight_transposed; delete block3_trans_weight_transposed;
-  delete block4_trans_weight_transposed; delete block5_trans_weight_transposed;
-  delete block6_trans_weight_transposed;
-
-  delete block0_trans_col_buffer; delete block1_trans_col_buffer;
-  delete block2_trans_col_buffer; delete block3_trans_col_buffer;
-  delete block4_trans_col_buffer; delete block5_trans_col_buffer;
-  delete block6_trans_col_buffer;
 }
 
 /* [Model Computation] */
@@ -724,63 +846,63 @@ void generate(float *inputs, float *outputs, size_t n_samples) {
     FusedLinearLeakyReLU(mlp6_a, mlp7_w, mlp7_b, mlp7_a, 0.01f);
 
     StyledConv(constant_input, mlp7_a, conv1_modulate_w, conv1_modulate_b, conv1_w, conv1_b, kernel, conv1_noise, conv1_output_a,
-               conv1_style_a, conv1_weight_a, conv1_demod_a, conv1_col_buffer, nullptr, nullptr, nullptr, nullptr, false, 1);
+               conv1_style_a, conv1_weight_a, conv1_demod_a, conv1_col_buffer, nullptr, nullptr, nullptr, nullptr, false, 1, streams);
     ToRGB(conv1_output_a, nullptr, mlp7_a, to_rgb_modulate_w, to_rgb_modulate_b, to_rgb_w, to_rgb_b, kernel, to_rgb_output_a,
           to_rgb_style_a, to_rgb_weight_a, nullptr, nullptr, nullptr, nullptr); // Creates the first skip connection
 
     // Block 0: 4x4 -> 8x8
     StyledConv(conv1_output_a, mlp7_a, block0_conv_up_modulate_w, block0_conv_up_modulate_b, block0_conv_up_w, block0_conv_up_b, kernel, block0_noise1, block0_conv_up_output_a,
-               block0_conv_up_style_a, block0_conv_up_weight_a, block0_conv_up_demod_a, block0_trans_col_buffer, block0_trans_weight_transposed, block0_conv_up_conv_a, block0_conv_up_upsample_a, block0_conv_up_conv2_a, true, 0);
+               block0_conv_up_style_a, block0_conv_up_weight_a, block0_conv_up_demod_a, block0_trans_col_buffer, block0_trans_weight_transposed, block0_conv_up_conv_a, block0_conv_up_upsample_a, block0_conv_up_conv2_a, true, 0, streams);
     StyledConv(block0_conv_up_output_a, mlp7_a, block0_conv_modulate_w, block0_conv_modulate_b, block0_conv_w, block0_conv_b, kernel, block0_noise2, block0_conv_output_a,
-               block0_conv_style_a, block0_conv_weight_a, block0_conv_demod_a, block0_conv_col_buffer, nullptr, nullptr, nullptr, nullptr, false, 1);
+               block0_conv_style_a, block0_conv_weight_a, block0_conv_demod_a, block0_conv_col_buffer, nullptr, nullptr, nullptr, nullptr, false, 1, streams);
     ToRGB(block0_conv_output_a, to_rgb_output_a, mlp7_a, block0_to_rgb_modulate_w, block0_to_rgb_modulate_b, block0_to_rgb_w, block0_to_rgb_b, kernel, block0_to_rgb_output_a,
           block0_to_rgb_style_a, block0_to_rgb_weight_a, nullptr, block0_to_rgb_skip_upsample_a, block0_to_rgb_skip_conv_a, block0_skip_a);
 
     // Block 1: 8x8 -> 16x16
     StyledConv(block0_conv_output_a, mlp7_a, block1_conv_up_modulate_w, block1_conv_up_modulate_b, block1_conv_up_w, block1_conv_up_b, kernel, block1_noise1, block1_conv_up_output_a,
-               block1_conv_up_style_a, block1_conv_up_weight_a, block1_conv_up_demod_a,  block1_trans_col_buffer, block1_trans_weight_transposed, block1_conv_up_conv_a, block1_conv_up_upsample_a, block1_conv_up_conv2_a, true, 0);
+               block1_conv_up_style_a, block1_conv_up_weight_a, block1_conv_up_demod_a,  block1_trans_col_buffer, block1_trans_weight_transposed, block1_conv_up_conv_a, block1_conv_up_upsample_a, block1_conv_up_conv2_a, true, 0, streams);
     StyledConv(block1_conv_up_output_a, mlp7_a, block1_conv_modulate_w, block1_conv_modulate_b, block1_conv_w, block1_conv_b, kernel, block1_noise2, block1_conv_output_a,
-               block1_conv_style_a, block1_conv_weight_a, block1_conv_demod_a, block1_conv_col_buffer, nullptr, nullptr, nullptr, nullptr, false, 1);
+               block1_conv_style_a, block1_conv_weight_a, block1_conv_demod_a, block1_conv_col_buffer, nullptr, nullptr, nullptr, nullptr, false, 1, streams);
     ToRGB(block1_conv_output_a, block0_to_rgb_output_a, mlp7_a, block1_to_rgb_modulate_w, block1_to_rgb_modulate_b, block1_to_rgb_w, block1_to_rgb_b, kernel, block1_to_rgb_output_a,
           block1_to_rgb_style_a, block1_to_rgb_weight_a, nullptr, block1_to_rgb_skip_upsample_a, block1_to_rgb_skip_conv_a, block1_skip_a);
 
     // Block 2: 16x16 -> 32x32
     StyledConv(block1_conv_output_a, mlp7_a, block2_conv_up_modulate_w, block2_conv_up_modulate_b, block2_conv_up_w, block2_conv_up_b, kernel, block2_noise1, block2_conv_up_output_a,
-               block2_conv_up_style_a, block2_conv_up_weight_a, block2_conv_up_demod_a,  block2_trans_col_buffer, block2_trans_weight_transposed, block2_conv_up_conv_a, block2_conv_up_upsample_a, block2_conv_up_conv2_a, true, 0);
+               block2_conv_up_style_a, block2_conv_up_weight_a, block2_conv_up_demod_a,  block2_trans_col_buffer, block2_trans_weight_transposed, block2_conv_up_conv_a, block2_conv_up_upsample_a, block2_conv_up_conv2_a, true, 0, streams);
     StyledConv(block2_conv_up_output_a, mlp7_a, block2_conv_modulate_w, block2_conv_modulate_b, block2_conv_w, block2_conv_b, kernel, block2_noise2, block2_conv_output_a,
-               block2_conv_style_a, block2_conv_weight_a, block2_conv_demod_a, block2_conv_col_buffer, nullptr, nullptr, nullptr, nullptr, false, 1);
+               block2_conv_style_a, block2_conv_weight_a, block2_conv_demod_a, block2_conv_col_buffer, nullptr, nullptr, nullptr, nullptr, false, 1, streams);
     ToRGB(block2_conv_output_a, block1_to_rgb_output_a, mlp7_a, block2_to_rgb_modulate_w, block2_to_rgb_modulate_b, block2_to_rgb_w, block2_to_rgb_b, kernel, block2_to_rgb_output_a,
           block2_to_rgb_style_a, block2_to_rgb_weight_a, nullptr, block2_to_rgb_skip_upsample_a, block2_to_rgb_skip_conv_a, block2_skip_a);
 
     // Block 3: 32x32 -> 64x64
     StyledConv(block2_conv_output_a, mlp7_a, block3_conv_up_modulate_w, block3_conv_up_modulate_b, block3_conv_up_w, block3_conv_up_b, kernel, block3_noise1, block3_conv_up_output_a,
-               block3_conv_up_style_a, block3_conv_up_weight_a, block3_conv_up_demod_a,  block3_trans_col_buffer, block3_trans_weight_transposed, block3_conv_up_conv_a, block3_conv_up_upsample_a, block3_conv_up_conv2_a, true, 0);
+               block3_conv_up_style_a, block3_conv_up_weight_a, block3_conv_up_demod_a,  block3_trans_col_buffer, block3_trans_weight_transposed, block3_conv_up_conv_a, block3_conv_up_upsample_a, block3_conv_up_conv2_a, true, 0, streams);
     StyledConv(block3_conv_up_output_a, mlp7_a, block3_conv_modulate_w, block3_conv_modulate_b, block3_conv_w, block3_conv_b, kernel, block3_noise2, block3_conv_output_a,
-               block3_conv_style_a, block3_conv_weight_a, block3_conv_demod_a, block3_conv_col_buffer, nullptr, nullptr, nullptr, nullptr, false, 1);
+               block3_conv_style_a, block3_conv_weight_a, block3_conv_demod_a, block3_conv_col_buffer, nullptr, nullptr, nullptr, nullptr, false, 1, streams);
     ToRGB(block3_conv_output_a, block2_to_rgb_output_a, mlp7_a, block3_to_rgb_modulate_w, block3_to_rgb_modulate_b, block3_to_rgb_w, block3_to_rgb_b, kernel, block3_to_rgb_output_a,
           block3_to_rgb_style_a, block3_to_rgb_weight_a, nullptr, block3_to_rgb_skip_upsample_a, block3_to_rgb_skip_conv_a, block3_skip_a);
 
     // Block 4: 64x64 -> 128x128
     StyledConv(block3_conv_output_a, mlp7_a, block4_conv_up_modulate_w, block4_conv_up_modulate_b, block4_conv_up_w, block4_conv_up_b, kernel, block4_noise1, block4_conv_up_output_a,
-               block4_conv_up_style_a, block4_conv_up_weight_a, block4_conv_up_demod_a, block4_trans_col_buffer, block4_trans_weight_transposed, block4_conv_up_conv_a, block4_conv_up_upsample_a, block4_conv_up_conv2_a, true, 0);
+               block4_conv_up_style_a, block4_conv_up_weight_a, block4_conv_up_demod_a, block4_trans_col_buffer, block4_trans_weight_transposed, block4_conv_up_conv_a, block4_conv_up_upsample_a, block4_conv_up_conv2_a, true, 0, streams);
     StyledConv(block4_conv_up_output_a, mlp7_a, block4_conv_modulate_w, block4_conv_modulate_b, block4_conv_w, block4_conv_b, kernel, block4_noise2, block4_conv_output_a,
-               block4_conv_style_a, block4_conv_weight_a, block4_conv_demod_a, block4_conv_col_buffer, nullptr, nullptr, nullptr, nullptr, false, 1);
+               block4_conv_style_a, block4_conv_weight_a, block4_conv_demod_a, block4_conv_col_buffer, nullptr, nullptr, nullptr, nullptr, false, 1, streams);
     ToRGB(block4_conv_output_a, block3_to_rgb_output_a, mlp7_a, block4_to_rgb_modulate_w, block4_to_rgb_modulate_b, block4_to_rgb_w, block4_to_rgb_b, kernel, block4_to_rgb_output_a,
           block4_to_rgb_style_a, block4_to_rgb_weight_a, nullptr, block4_to_rgb_skip_upsample_a, block4_to_rgb_skip_conv_a, block4_skip_a);
 
     // Block 5: 128x128 -> 256x256
     StyledConv(block4_conv_output_a, mlp7_a, block5_conv_up_modulate_w, block5_conv_up_modulate_b, block5_conv_up_w, block5_conv_up_b, kernel, block5_noise1, block5_conv_up_output_a,
-               block5_conv_up_style_a, block5_conv_up_weight_a, block5_conv_up_demod_a, block5_trans_col_buffer, block5_trans_weight_transposed, block5_conv_up_conv_a, block5_conv_up_upsample_a, block5_conv_up_conv2_a, true, 0);
+               block5_conv_up_style_a, block5_conv_up_weight_a, block5_conv_up_demod_a, block5_trans_col_buffer, block5_trans_weight_transposed, block5_conv_up_conv_a, block5_conv_up_upsample_a, block5_conv_up_conv2_a, true, 0, streams);
     StyledConv(block5_conv_up_output_a, mlp7_a, block5_conv_modulate_w, block5_conv_modulate_b, block5_conv_w, block5_conv_b, kernel, block5_noise2, block5_conv_output_a,
-               block5_conv_style_a, block5_conv_weight_a, block5_conv_demod_a, block5_conv_col_buffer, nullptr, nullptr, nullptr, nullptr, false, 1);
+               block5_conv_style_a, block5_conv_weight_a, block5_conv_demod_a, block5_conv_col_buffer, nullptr, nullptr, nullptr, nullptr, false, 1, streams);
     ToRGB(block5_conv_output_a, block4_to_rgb_output_a, mlp7_a, block5_to_rgb_modulate_w, block5_to_rgb_modulate_b, block5_to_rgb_w, block5_to_rgb_b, kernel, block5_to_rgb_output_a,
           block5_to_rgb_style_a, block5_to_rgb_weight_a, nullptr, block5_to_rgb_skip_upsample_a, block5_to_rgb_skip_conv_a, block5_skip_a);
 
     // Block 6: 256x256 -> 512x512
     StyledConv(block5_conv_output_a, mlp7_a, block6_conv_up_modulate_w, block6_conv_up_modulate_b, block6_conv_up_w, block6_conv_up_b, kernel, block6_noise1, block6_conv_up_output_a,
-               block6_conv_up_style_a, block6_conv_up_weight_a, block6_conv_up_demod_a, block6_trans_col_buffer, block6_trans_weight_transposed, block6_conv_up_conv_a, block6_conv_up_upsample_a, block6_conv_up_conv2_a, true, 0);
+               block6_conv_up_style_a, block6_conv_up_weight_a, block6_conv_up_demod_a, block6_trans_col_buffer, block6_trans_weight_transposed, block6_conv_up_conv_a, block6_conv_up_upsample_a, block6_conv_up_conv2_a, true, 0, streams);
     StyledConv(block6_conv_up_output_a, mlp7_a, block6_conv_modulate_w, block6_conv_modulate_b, block6_conv_w, block6_conv_b, kernel, block6_noise2, block6_conv_output_a,
-               block6_conv_style_a, block6_conv_weight_a, block6_conv_demod_a, block6_conv_col_buffer, nullptr, nullptr, nullptr, nullptr, false, 1);
+               block6_conv_style_a, block6_conv_weight_a, block6_conv_demod_a, block6_conv_col_buffer, nullptr, nullptr, nullptr, nullptr, false, 1, streams);
     ToRGB(block6_conv_output_a, block5_to_rgb_output_a, mlp7_a, block6_to_rgb_modulate_w, block6_to_rgb_modulate_b, block6_to_rgb_w, block6_to_rgb_b, kernel, block6_to_rgb_output_a,
           block6_to_rgb_style_a, block6_to_rgb_weight_a, nullptr, block6_to_rgb_skip_upsample_a, block6_to_rgb_skip_conv_a, block6_skip_a);
 
