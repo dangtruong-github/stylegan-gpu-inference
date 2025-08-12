@@ -293,6 +293,7 @@ void bmm_wrapper(Tensor *A, Tensor *B, Tensor *C, bool A_to_device, bool B_to_de
   double total_func_time = func_end_time - func_start_time;
   double sum_of_parts = to_device_time + kernel_exec_time_s + from_device_time;
   
+  /*
   printf("\n--- bmm_wrapper (Multi-GPU) Timing Report ---\n");
   printf("Total Function Time         : %.6f s\n", total_func_time);
   printf("--------------------------------------------\n");
@@ -303,6 +304,7 @@ void bmm_wrapper(Tensor *A, Tensor *B, Tensor *C, bool A_to_device, bool B_to_de
   printf("Sum of Timed Parts          : %.6f s\n", sum_of_parts);
   printf("Unaccounted CPU Overhead    : %.6f s\n", total_func_time - sum_of_parts);
   printf("--- End of Report ---\n\n");
+  */
 }
 
 /**
@@ -533,6 +535,7 @@ void im2col_wrapper(Tensor *input, Tensor *col_buffer, bool input_to_device, boo
   double total_func_time = get_time_kernel() - func_start_time;
   double sum_of_parts = to_device_time + kernel_exec_time_s + from_device_time;
   
+  /*
   printf("\n--- im2col_wrapper (Multi-GPU) Timing Report ---\n");
   printf("Total Function Time         : %.6f s\n", total_func_time);
   printf("--------------------------------------------\n");
@@ -543,6 +546,7 @@ void im2col_wrapper(Tensor *input, Tensor *col_buffer, bool input_to_device, boo
   printf("Sum of Timed Parts          : %.6f s\n", sum_of_parts);
   printf("Unaccounted CPU Overhead    : %.6f s\n", total_func_time - sum_of_parts);
   printf("--- End of Report ---\n\n");
+  */
 }
 
 
@@ -646,6 +650,7 @@ void col2im_wrapper(Tensor *col_buffer, Tensor *output, int H, int W, bool col_b
   double total_func_time = get_time_kernel() - func_start_time;
   double sum_of_parts = to_device_time + kernel_exec_time_s + from_device_time;
   
+  /*
   printf("\n--- col2im_wrapper (Multi-GPU) Timing Report ---\n");
   printf("Total Function Time         : %.6f s\n", total_func_time);
   printf("--------------------------------------------\n");
@@ -656,6 +661,7 @@ void col2im_wrapper(Tensor *col_buffer, Tensor *output, int H, int W, bool col_b
   printf("Sum of Timed Parts          : %.6f s\n", sum_of_parts);
   printf("Unaccounted CPU Overhead    : %.6f s\n", total_func_time - sum_of_parts);
   printf("--- End of Report ---\n\n");
+  */
 }
 
 
@@ -753,6 +759,7 @@ void transpose_wrapper(Tensor *weight, Tensor *weight_transpose, bool weight_to_
     double total_func_time = get_time_kernel() - func_start_time;
     double sum_of_parts = to_device_time + kernel_exec_time_s + from_device_time;
     
+    /*
     printf("\n--- transpose_wrapper (Multi-GPU) Timing Report ---\n");
     printf("Total Function Time         : %.6f s\n", total_func_time);
     printf("--------------------------------------------\n");
@@ -763,8 +770,113 @@ void transpose_wrapper(Tensor *weight, Tensor *weight_transpose, bool weight_to_
     printf("Sum of Timed Parts          : %.6f s\n", sum_of_parts);
     printf("Unaccounted CPU Overhead    : %.6f s\n", total_func_time - sum_of_parts);
     printf("--- End of Report ---\n\n");
+    */
 }
 
+/**
+ * @brief CUDA kernel for demodulating convolution weights.
+ *
+ * Each thread processes one filter for one sample in the batch. It first calculates
+ * the sum of squares of the filter weights, then computes a normalization factor
+ * using rsqrtf (inverse square root), and finally applies this factor to all
+ * weights in the filter.
+ *
+ * @param weight Pointer to the weight tensor data on the GPU. The data is modified in-place.
+ * @param total_filters The total number of filters to process (N * out_C).
+ * @param weight_inner_dim The number of elements per filter (in_C * R * S).
+ */
+__global__ void demodulate_kernel(float *weight, size_t total_filters, size_t weight_inner_dim) {
+    // Calculate the global thread ID
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // Ensure the thread is within the bounds of the filters to process
+    if (idx < total_filters) {
+        // Get a pointer to the start of the current filter
+        float *filter_ptr = weight + idx * weight_inner_dim;
+
+        // --- Pass 1: Calculate the sum of squares for the filter ---
+        float sum_sq = 0.0f;
+        for (size_t i = 0; i < weight_inner_dim; ++i) {
+            float w = filter_ptr[i];
+            sum_sq += w * w;
+        }
+
+        // --- Pass 2: Calculate and apply the demodulation factor ---
+        // Add a small epsilon for numerical stability
+        float demod_factor = rsqrtf(sum_sq + 1e-8f);
+        for (size_t i = 0; i < weight_inner_dim; ++i) {
+            filter_ptr[i] *= demod_factor;
+        }
+    }
+}
+
+/**
+ * @brief Launches demodulation kernels across multiple GPUs using pre-distributed data.
+ *
+ * This function assumes the Tensor struct contains an array of device pointers
+ * (`d_buf`), where `d_buf[i]` points to the data already allocated on GPU `i`.
+ * It splits the total batch workload and launches a kernel on each GPU
+ * to process its respective data slice.
+ *
+ * @param weight_a The weight tensor. Its `d_buf` field must contain a valid pointer for each GPU.
+ * @param in_C Number of input channels.
+ * @param R Kernel height.
+ * @param S Kernel width.
+ * @param NUM_GPUS The number of GPUs to use.
+ * @param streams An array of CUDA streams, one for each GPU.
+ */
+void demodulate_wrapper(Tensor *weight_a, bool weight_to_device, bool weight_from_device, size_t in_C, size_t R, size_t S, cudaStream_t *streams) {
+  size_t total_samples = weight_a->shape[0]; // Total batch size across all GPUs
+  size_t out_C = weight_a->shape[1];
+  size_t weight_inner_dim = in_C * R * S;
+
+  if (weight_to_device) weight_a->to_device(streams);
+
+  // Use OpenMP to parallelize kernel launches, assigning one CPU thread per GPU.
+  #pragma omp parallel for
+  for (int i = 0; i < NUM_GPUS; ++i) {
+      // Set the active GPU for the current CPU thread.
+      CHECK_CUDA(cudaSetDevice(i));
+
+      // --- Distribute Workload ---
+      // Calculate the slice of the batch this GPU is responsible for.
+      size_t start_sample = total_samples * i / NUM_GPUS;
+      size_t end_sample = total_samples * (i + 1) / NUM_GPUS;
+      size_t num_samples_for_gpu = end_sample - start_sample;
+
+      if (num_samples_for_gpu == 0) {
+          continue; // Skip if this GPU has no work.
+      }
+
+      // --- Get Pre-assigned Data Pointer for this GPU ---
+      // This is the key change: directly use the pointer for the current device.
+      float* data_ptr_for_gpu = weight_a->d_buf[i];
+      
+      // The total number of filters this GPU will process.
+      size_t total_filters_on_gpu = num_samples_for_gpu * out_C;
+      
+      // --- Launch Kernel ---
+      const int threads_per_block = 256;
+      const int blocks_per_grid = (total_filters_on_gpu + threads_per_block - 1) / threads_per_block;
+
+      demodulate_kernel<<<blocks_per_grid, threads_per_block, 0, streams[i]>>>(
+          data_ptr_for_gpu,
+          total_filters_on_gpu,
+          weight_inner_dim
+      );
+  }
+
+  // --- Synchronize all streams across all devices ---
+  if (weight_from_device) {
+    weight_a->from_device(streams);
+    for (int i = 0; i < NUM_GPUS; ++i) {
+      CHECK_CUDA(cudaSetDevice(i));
+      CHECK_CUDA(cudaStreamSynchronize(streams[i]));
+    }
+  }
+  // Reset to the primary device.
+  CHECK_CUDA(cudaSetDevice(0));
+}
 
 // -------------- MAIN FUNCTION ---------------------
 
@@ -1008,7 +1120,7 @@ void UpsamplePad(Tensor *input, Tensor *output, size_t up, size_t pad0, size_t p
  * OW = (W + 2 * pad - dilation * (S - 1) - 1) / stride + 1
  * pad = 1, dilation = 1, stride = 1
  */
-void Conv2d(Tensor *input, Tensor *weight, Tensor *output, cudaStream_t* streams) {
+void Conv2d(Tensor *input, Tensor *weight, Tensor *output, bool demodulate, cudaStream_t* streams) {
   // --- Timing variables ---
   double func_start_time = get_time_kernel();
   // --- End of Timing variables ---
@@ -1020,7 +1132,7 @@ void Conv2d(Tensor *input, Tensor *weight, Tensor *output, cudaStream_t* streams
   weight->reshape({N, K, C});
   input->reshape({N, C, H*W});
   output->reshape({N, K, OH*OW});
-  bmm_wrapper(weight, input, output, true, true, true, streams);
+  bmm_wrapper(weight, input, output, !demodulate, true, true, streams);
 
   weight->reshape({N, K, C, 1, 1});
   input->reshape({N, C, H, W});
@@ -1113,7 +1225,6 @@ void Conv2d_same(Tensor *input, Tensor *weight, Tensor *output,
   double func_end_time = get_time_kernel();
   double total_time = func_end_time - func_start_time;
 
-  /*
   printf("\n--- Conv2d_same Timing Report ---\n");
   input->printShape("input");
   weight->printShape("weight");
@@ -1121,7 +1232,6 @@ void Conv2d_same(Tensor *input, Tensor *weight, Tensor *output,
   printf("N: %zu, OH: %zu, OW: %zu, stride: %d, pad: %d, dilation: %d\n", N, OH, OW, stride, pad, dilation);
   printf("Total Function Time: %.6f s\n", total_time);
   printf("--- End of Report ---\n\n");
-  */
 }
 
 /*
@@ -1134,7 +1244,7 @@ void Conv2d_same(Tensor *input, Tensor *weight, Tensor *output,
  * OW = (W + 2 * pad - dilation * (S - 1) - 1) / stride + 1
  * pad = 1, dilation = 1, stride = 1, R = S = 3
  */
-void Conv2d_im2col(Tensor *input, Tensor *weight, Tensor *output, Tensor *col_buffer, cudaStream_t *streams) {
+void Conv2d_im2col(Tensor *input, Tensor *weight, Tensor *output, Tensor *col_buffer, bool demodulate, cudaStream_t *streams) {
   // --- Timing variables ---
   double func_start_time = get_time_kernel();
   double start_time, end_time;
@@ -1175,7 +1285,7 @@ void Conv2d_im2col(Tensor *input, Tensor *weight, Tensor *output, Tensor *col_bu
   // Note that `col_buffer` is already in the correct format and can be used directly.
   // output_view = weight_view @ col_buffer
   start_time = get_time_kernel();
-  bmm_wrapper(weight, col_buffer, output, true, false, true, streams);
+  bmm_wrapper(weight, col_buffer, output, !demodulate, false, true, streams);
   end_time = get_time_kernel();
   bmm_time = end_time - start_time;
 
@@ -1188,7 +1298,6 @@ void Conv2d_im2col(Tensor *input, Tensor *weight, Tensor *output, Tensor *col_bu
   double total_func_time = func_end_time - func_start_time;
   double sum_of_parts = im2col_time + bmm_time;
 
-  /*
   printf("\n--- Conv2d_im2col Timing Report ---\n");
   input->printShape("input Conv2d_im2col");
   col_buffer->printShape("col_buffer Conv2d_im2col");
@@ -1203,7 +1312,6 @@ void Conv2d_im2col(Tensor *input, Tensor *weight, Tensor *output, Tensor *col_bu
   printf("Sum of Timed Parts  : %.6f s\n", sum_of_parts);
   printf("Unaccounted Time    : %.6f s (e.g., reshape)\n", total_func_time - sum_of_parts);
   printf("--- End of Report ---\n\n");
-  */
 }
 
 /**
@@ -1513,6 +1621,7 @@ void ModulatedConv2d(Tensor *input, Tensor *style, Tensor *modulate_weight, Tens
   if (demodulate) {
     start_time = get_time_kernel();
     // --- Demodulation Step ---
+    /*
     #pragma omp parallel for
     for (size_t n = 0; n < N; ++n) {
       size_t n_offset = n * out_C * in_C * R * S;
@@ -1532,15 +1641,18 @@ void ModulatedConv2d(Tensor *input, Tensor *style, Tensor *modulate_weight, Tens
         }
       }
     }
-      end_time = get_time_kernel();
-      demodulation_time = end_time - start_time;
+    */
+
+    demodulate_wrapper(weight_a, true, false, in_C, R, S, streams);
+    end_time = get_time_kernel();
+    demodulation_time = end_time - start_time;
   }
 
   if (upsample) {
     conv_path_taken = "Upsample Path";
     start_time = get_time_kernel();
     // transpose(weight_a, weight_transposed);
-    transpose_wrapper(weight_a, weight_transposed, true, false, streams);
+    transpose_wrapper(weight_a, weight_transposed, false, false, streams);
     end_time = get_time_kernel();
     transpose_time = end_time - start_time;
     
@@ -1559,10 +1671,10 @@ void ModulatedConv2d(Tensor *input, Tensor *style, Tensor *modulate_weight, Tens
     // The optimized path requires K (output channels) to be a multiple of 64.
     if (weight_a->shape[1] % 64 != 0) {
       conv_path_taken = "Conv2d (Standard)";
-      Conv2d(input, weight_a, output, streams);
+      Conv2d(input, weight_a, output, demodulate, streams);
     } else {
       conv_path_taken = "Conv2d_Optimized";
-      Conv2d_im2col(input, weight_a, output, col_buffer, streams);
+      Conv2d_im2col(input, weight_a, output, col_buffer, demodulate, streams);
     }
     end_time = get_time_kernel();
     conv2d_time = end_time - start_time;
