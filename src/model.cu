@@ -794,10 +794,12 @@ void generate(float *inputs, float *outputs, size_t n_samples) {
     FusedLinearLeakyReLU(mlp5_a, mlp6_w, mlp6_b, mlp6_a, 0.01f);
     FusedLinearLeakyReLU(mlp6_a, mlp7_w, mlp7_b, mlp7_a, 0.01f);
 
+    to_rgb_weight_a->to_device(streams);
+
     StyledConv(constant_input, mlp7_a, conv1_modulate_w, conv1_modulate_b, conv1_w, conv1_b, kernel, conv1_noise, conv1_output_a,
                conv1_style_a, conv1_weight_a, conv1_demod_a, conv1_col_buffer, nullptr, nullptr, nullptr, nullptr, false, 1, streams);
     ToRGB(conv1_output_a, nullptr, mlp7_a, to_rgb_modulate_w, to_rgb_modulate_b, to_rgb_w, to_rgb_b, kernel, to_rgb_output_a,
-          to_rgb_style_a, to_rgb_weight_a, nullptr, nullptr, nullptr, nullptr); // Creates the first skip connection
+          to_rgb_style_a, to_rgb_weight_a, nullptr, nullptr, nullptr, nullptr, streams); // Creates the first skip connection
 
     // Block 0: 4x4 -> 8x8
     StyledConv(conv1_output_a, mlp7_a, block0_conv_up_modulate_w, block0_conv_up_modulate_b, block0_conv_up_w, block0_conv_up_b, kernel, block0_noise1, block0_conv_up_output_a,
@@ -805,7 +807,7 @@ void generate(float *inputs, float *outputs, size_t n_samples) {
     StyledConv(block0_conv_up_output_a, mlp7_a, block0_conv_modulate_w, block0_conv_modulate_b, block0_conv_w, block0_conv_b, kernel, block0_noise2, block0_conv_output_a,
                block0_conv_style_a, block0_conv_weight_a, block0_conv_demod_a, block0_conv_col_buffer, nullptr, nullptr, nullptr, nullptr, false, 1, streams);
     ToRGB(block0_conv_output_a, to_rgb_output_a, mlp7_a, block0_to_rgb_modulate_w, block0_to_rgb_modulate_b, block0_to_rgb_w, block0_to_rgb_b, kernel, block0_to_rgb_output_a,
-          block0_to_rgb_style_a, block0_to_rgb_weight_a, nullptr, block0_to_rgb_skip_upsample_a, block0_to_rgb_skip_conv_a, block0_skip_a);
+          block0_to_rgb_style_a, block0_to_rgb_weight_a, nullptr, block0_to_rgb_skip_upsample_a, block0_to_rgb_skip_conv_a, block0_skip_a, streams);
 
     // Block 1: 8x8 -> 16x16
     StyledConv(block0_conv_output_a, mlp7_a, block1_conv_up_modulate_w, block1_conv_up_modulate_b, block1_conv_up_w, block1_conv_up_b, kernel, block1_noise1, block1_conv_up_output_a,
@@ -813,7 +815,7 @@ void generate(float *inputs, float *outputs, size_t n_samples) {
     StyledConv(block1_conv_up_output_a, mlp7_a, block1_conv_modulate_w, block1_conv_modulate_b, block1_conv_w, block1_conv_b, kernel, block1_noise2, block1_conv_output_a,
                block1_conv_style_a, block1_conv_weight_a, block1_conv_demod_a, block1_conv_col_buffer, nullptr, nullptr, nullptr, nullptr, false, 1, streams);
     ToRGB(block1_conv_output_a, block0_to_rgb_output_a, mlp7_a, block1_to_rgb_modulate_w, block1_to_rgb_modulate_b, block1_to_rgb_w, block1_to_rgb_b, kernel, block1_to_rgb_output_a,
-          block1_to_rgb_style_a, block1_to_rgb_weight_a, nullptr, block1_to_rgb_skip_upsample_a, block1_to_rgb_skip_conv_a, block1_skip_a);
+          block1_to_rgb_style_a, block1_to_rgb_weight_a, nullptr, block1_to_rgb_skip_upsample_a, block1_to_rgb_skip_conv_a, block1_skip_a, streams);
 
     // Block 2: 16x16 -> 32x32
     StyledConv(block1_conv_output_a, mlp7_a, block2_conv_up_modulate_w, block2_conv_up_modulate_b, block2_conv_up_w, block2_conv_up_b, kernel, block2_noise1, block2_conv_up_output_a,
@@ -821,7 +823,7 @@ void generate(float *inputs, float *outputs, size_t n_samples) {
     StyledConv(block2_conv_up_output_a, mlp7_a, block2_conv_modulate_w, block2_conv_modulate_b, block2_conv_w, block2_conv_b, kernel, block2_noise2, block2_conv_output_a,
                block2_conv_style_a, block2_conv_weight_a, block2_conv_demod_a, block2_conv_col_buffer, nullptr, nullptr, nullptr, nullptr, false, 1, streams);
     ToRGB(block2_conv_output_a, block1_to_rgb_output_a, mlp7_a, block2_to_rgb_modulate_w, block2_to_rgb_modulate_b, block2_to_rgb_w, block2_to_rgb_b, kernel, block2_to_rgb_output_a,
-          block2_to_rgb_style_a, block2_to_rgb_weight_a, nullptr, block2_to_rgb_skip_upsample_a, block2_to_rgb_skip_conv_a, block2_skip_a);
+          block2_to_rgb_style_a, block2_to_rgb_weight_a, nullptr, block2_to_rgb_skip_upsample_a, block2_to_rgb_skip_conv_a, block2_skip_a, streams);
 
     // Block 3: 32x32 -> 64x64
     StyledConv(block2_conv_output_a, mlp7_a, block3_conv_up_modulate_w, block3_conv_up_modulate_b, block3_conv_up_w, block3_conv_up_b, kernel, block3_noise1, block3_conv_up_output_a,
@@ -829,7 +831,7 @@ void generate(float *inputs, float *outputs, size_t n_samples) {
     StyledConv(block3_conv_up_output_a, mlp7_a, block3_conv_modulate_w, block3_conv_modulate_b, block3_conv_w, block3_conv_b, kernel, block3_noise2, block3_conv_output_a,
                block3_conv_style_a, block3_conv_weight_a, block3_conv_demod_a, block3_conv_col_buffer, nullptr, nullptr, nullptr, nullptr, false, 1, streams);
     ToRGB(block3_conv_output_a, block2_to_rgb_output_a, mlp7_a, block3_to_rgb_modulate_w, block3_to_rgb_modulate_b, block3_to_rgb_w, block3_to_rgb_b, kernel, block3_to_rgb_output_a,
-          block3_to_rgb_style_a, block3_to_rgb_weight_a, nullptr, block3_to_rgb_skip_upsample_a, block3_to_rgb_skip_conv_a, block3_skip_a);
+          block3_to_rgb_style_a, block3_to_rgb_weight_a, nullptr, block3_to_rgb_skip_upsample_a, block3_to_rgb_skip_conv_a, block3_skip_a, streams);
 
     // Block 4: 64x64 -> 128x128
     StyledConv(block3_conv_output_a, mlp7_a, block4_conv_up_modulate_w, block4_conv_up_modulate_b, block4_conv_up_w, block4_conv_up_b, kernel, block4_noise1, block4_conv_up_output_a,
@@ -837,7 +839,7 @@ void generate(float *inputs, float *outputs, size_t n_samples) {
     StyledConv(block4_conv_up_output_a, mlp7_a, block4_conv_modulate_w, block4_conv_modulate_b, block4_conv_w, block4_conv_b, kernel, block4_noise2, block4_conv_output_a,
                block4_conv_style_a, block4_conv_weight_a, block4_conv_demod_a, block4_conv_col_buffer, nullptr, nullptr, nullptr, nullptr, false, 1, streams);
     ToRGB(block4_conv_output_a, block3_to_rgb_output_a, mlp7_a, block4_to_rgb_modulate_w, block4_to_rgb_modulate_b, block4_to_rgb_w, block4_to_rgb_b, kernel, block4_to_rgb_output_a,
-          block4_to_rgb_style_a, block4_to_rgb_weight_a, nullptr, block4_to_rgb_skip_upsample_a, block4_to_rgb_skip_conv_a, block4_skip_a);
+          block4_to_rgb_style_a, block4_to_rgb_weight_a, nullptr, block4_to_rgb_skip_upsample_a, block4_to_rgb_skip_conv_a, block4_skip_a, streams);
 
     // Block 5: 128x128 -> 256x256
     StyledConv(block4_conv_output_a, mlp7_a, block5_conv_up_modulate_w, block5_conv_up_modulate_b, block5_conv_up_w, block5_conv_up_b, kernel, block5_noise1, block5_conv_up_output_a,
@@ -845,7 +847,7 @@ void generate(float *inputs, float *outputs, size_t n_samples) {
     StyledConv(block5_conv_up_output_a, mlp7_a, block5_conv_modulate_w, block5_conv_modulate_b, block5_conv_w, block5_conv_b, kernel, block5_noise2, block5_conv_output_a,
                block5_conv_style_a, block5_conv_weight_a, block5_conv_demod_a, block5_conv_col_buffer, nullptr, nullptr, nullptr, nullptr, false, 1, streams);
     ToRGB(block5_conv_output_a, block4_to_rgb_output_a, mlp7_a, block5_to_rgb_modulate_w, block5_to_rgb_modulate_b, block5_to_rgb_w, block5_to_rgb_b, kernel, block5_to_rgb_output_a,
-          block5_to_rgb_style_a, block5_to_rgb_weight_a, nullptr, block5_to_rgb_skip_upsample_a, block5_to_rgb_skip_conv_a, block5_skip_a);
+          block5_to_rgb_style_a, block5_to_rgb_weight_a, nullptr, block5_to_rgb_skip_upsample_a, block5_to_rgb_skip_conv_a, block5_skip_a, streams);
 
     // Block 6: 256x256 -> 512x512
     StyledConv(block5_conv_output_a, mlp7_a, block6_conv_up_modulate_w, block6_conv_up_modulate_b, block6_conv_up_w, block6_conv_up_b, kernel, block6_noise1, block6_conv_up_output_a,
@@ -853,7 +855,7 @@ void generate(float *inputs, float *outputs, size_t n_samples) {
     StyledConv(block6_conv_up_output_a, mlp7_a, block6_conv_modulate_w, block6_conv_modulate_b, block6_conv_w, block6_conv_b, kernel, block6_noise2, block6_conv_output_a,
                block6_conv_style_a, block6_conv_weight_a, block6_conv_demod_a, block6_conv_col_buffer, nullptr, nullptr, nullptr, nullptr, false, 1, streams);
     ToRGB(block6_conv_output_a, block5_to_rgb_output_a, mlp7_a, block6_to_rgb_modulate_w, block6_to_rgb_modulate_b, block6_to_rgb_w, block6_to_rgb_b, kernel, block6_to_rgb_output_a,
-          block6_to_rgb_style_a, block6_to_rgb_weight_a, nullptr, block6_to_rgb_skip_upsample_a, block6_to_rgb_skip_conv_a, block6_skip_a);
+          block6_to_rgb_style_a, block6_to_rgb_weight_a, nullptr, block6_to_rgb_skip_upsample_a, block6_to_rgb_skip_conv_a, block6_skip_a, streams);
 
     /* Copy the final 512x512 RGB image to the local output buffer */
     memcpy(local_outputs + BATCH_SIZE * n * 3 * 512 * 512, block6_to_rgb_output_a->buf, BATCH_SIZE * 3 * 512 * 512 * sizeof(float));

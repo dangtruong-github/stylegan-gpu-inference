@@ -252,6 +252,7 @@ void Tensor::to_device(cudaStream_t *streams) {
         CHECK_CUDA(cudaSetDevice(i));
         // Asynchronously copy the segment of host buffer for this GPU on its respective stream
         float* host_segment = buf + i * per_gpu_elements;
+
         CHECK_CUDA(cudaMemcpyAsync(d_buf[i], host_segment, bytes_per_gpu, cudaMemcpyHostToDevice, streams[i]));
     }
 }

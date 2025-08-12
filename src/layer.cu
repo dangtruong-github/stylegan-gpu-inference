@@ -998,7 +998,6 @@ void UpsamplePad(Tensor *input, Tensor *output, size_t up, size_t pad0, size_t p
   }
 }
 
-
 /*
  * Convolution (with per-sample weights)
  * input shape = (N, C, H, W)
@@ -1009,7 +1008,7 @@ void UpsamplePad(Tensor *input, Tensor *output, size_t up, size_t pad0, size_t p
  * OW = (W + 2 * pad - dilation * (S - 1) - 1) / stride + 1
  * pad = 1, dilation = 1, stride = 1
  */
-void Conv2d(Tensor *input, Tensor *weight, Tensor *output) {
+void Conv2d(Tensor *input, Tensor *weight, Tensor *output, cudaStream_t* streams) {
   // --- Timing variables ---
   double func_start_time = get_time_kernel();
   // --- End of Timing variables ---
@@ -1018,107 +1017,14 @@ void Conv2d(Tensor *input, Tensor *weight, Tensor *output) {
   size_t K = weight->shape[1];
   size_t OH = output->shape[2], OW = output->shape[3];
 
-  #pragma omp parallel for collapse(2)
-  for (size_t n = 0; n < N; ++n) {
-    for (size_t k = 0; k < K; ++k) {
-      // Base pointers for the current (n, k) pair
-      const float* p_input_n = input->buf + n * C * H * W;
-      // Since R=S=1, the spatial size of the weight tensor is 1.
-      const float* p_weight_nk = weight->buf + n * K * C + k * C;
-      float* p_output_nk = output->buf + n * K * OH * OW + k * OH * OW;
+  weight->reshape({N, K, C});
+  input->reshape({N, C, H*W});
+  output->reshape({N, K, OH*OW});
+  bmm_wrapper(weight, input, output, true, true, true, streams);
 
-      // Guaranteed that OW is either 4 or a multiple of 8.
-      if (OW == 4) {
-        // ====================================================================
-        // PATH 1: Specialized AVX for OW=4, R=1, S=1 by unrolling OH by 2.
-        // Assumes OH is always a multiple of 2.
-        // ====================================================================
-        for (size_t oh = 0; oh < OH; oh += 2) {
-          // Accumulator for 2x4 = 8 pixels, for the output block at (oh, 0) and (oh+1, 0)
-          __m256 o_vec = _mm256_setzero_ps();
-
-          for (size_t c = 0; c < C; ++c) {
-            // Get the single weight for this input channel c.
-            const float* p_weight_c = p_weight_nk + c;
-            __m256 f_vec = _mm256_set1_ps(*p_weight_c);
-
-            const float* p_input_c = p_input_n + c * H * W;
-
-            // --- Load data for the first row (oh) ---
-            __m128 i_vec_row0 = _mm_setzero_ps();
-            if (oh < H) {
-              const float* p_input_row0 = p_input_c + oh * W;
-              // Since R=S=1, we load from the start of the 4-element block.
-              // A fast path for W>=4 is possible, but this handles all W.
-              float temp_i[4] = {0.0f};
-              for (size_t i = 0; i < W && i < 4; ++i) {
-                  temp_i[i] = p_input_row0[i];
-              }
-              i_vec_row0 = _mm_loadu_ps(temp_i);
-            }
-
-            // --- Load data for the second row (oh + 1) ---
-            __m128 i_vec_row1 = _mm_setzero_ps();
-            size_t h1 = oh + 1;
-            if (h1 < H) {
-              const float* p_input_row1 = p_input_c + h1 * W;
-              float temp_i[4] = {0.0f};
-              for (size_t i = 0; i < W && i < 4; ++i) {
-                  temp_i[i] = p_input_row1[i];
-              }
-              i_vec_row1 = _mm_loadu_ps(temp_i);
-            }
-            
-            // Combine the two 128-bit vectors into one 256-bit vector
-            __m256 i_vec = _mm256_castps128_ps256(i_vec_row0);
-            i_vec = _mm256_insertf128_ps(i_vec, i_vec_row1, 1);
-
-            // Fused Multiply-Add: o_vec += i_vec * f_vec
-            o_vec = _mm256_fmadd_ps(i_vec, f_vec, o_vec);
-          }
-
-          // Split the 256-bit result and store it into the two output rows
-          __m128 o_vec_row0 = _mm256_castps256_ps128(o_vec);
-          __m128 o_vec_row1 = _mm256_extractf128_ps(o_vec, 1);
-          _mm_storeu_ps(p_output_nk + oh * OW, o_vec_row0);
-          _mm_storeu_ps(p_output_nk + (oh + 1) * OW, o_vec_row1);
-        }
-      } else {
-        // ====================================================================
-        // PATH 2: Standard AVX Path for R=1, S=1
-        // Assumes OW is a multiple of 8.
-        // ====================================================================
-        for (size_t oh = 0; oh < OH; ++oh) {
-          for (size_t ow = 0; ow < OW; ow += 8) {
-            __m256 o_vec = _mm256_setzero_ps();
-
-            for (size_t c = 0; c < C; ++c) {
-              const float* p_weight_c = p_weight_nk + c;
-              __m256 f_vec = _mm256_set1_ps(*p_weight_c);
-              
-              __m256 i_vec = _mm256_setzero_ps();
-              size_t h = oh;
-              if (h < H) {
-                  const float* p_input_row = p_input_n + (c * H * W) + (h * W);
-                  // Since R=S=1, we load directly from input[h][ow]
-                  if (ow + 7 < W) {
-                      i_vec = _mm256_load_ps(p_input_row + ow);
-                  } else {
-                      float temp_i[8] = {0.0f};
-                      for (size_t i = 0; i < 8 && (ow + i) < W; ++i) {
-                          temp_i[i] = p_input_row[ow + i];
-                      }
-                      i_vec = _mm256_loadu_ps(temp_i);
-                  }
-              }
-              o_vec = _mm256_fmadd_ps(i_vec, f_vec, o_vec);
-            }
-            _mm256_store_ps(p_output_nk + oh * OW + ow, o_vec);
-          }
-        }
-      }
-    }
-  }
+  weight->reshape({N, K, C, 1, 1});
+  input->reshape({N, C, H, W});
+  output->reshape({N, K, OH, OW});
 
   // --- Print Timing Results ---
   double func_end_time = get_time_kernel();
@@ -1653,7 +1559,7 @@ void ModulatedConv2d(Tensor *input, Tensor *style, Tensor *modulate_weight, Tens
     // The optimized path requires K (output channels) to be a multiple of 64.
     if (weight_a->shape[1] % 64 != 0) {
       conv_path_taken = "Conv2d (Standard)";
-      Conv2d(input, weight_a, output);
+      Conv2d(input, weight_a, output, streams);
     } else {
       conv_path_taken = "Conv2d_Optimized";
       Conv2d_im2col(input, weight_a, output, col_buffer, streams);
@@ -1875,9 +1781,9 @@ void StyledConv(Tensor *input, Tensor *style, Tensor *modulate_weight, Tensor *m
 }
 
 void ToRGB(Tensor *input, Tensor *skip, Tensor *style, Tensor *modulate_weight, Tensor *modulate_bias, Tensor *conv_weight, Tensor *conv_bias, Tensor *kernel, Tensor *output,
-           Tensor *style_a, Tensor *weight_a, Tensor *col_buffer, Tensor *skip_upsample_a, Tensor *skip_conv_a, Tensor *skip_a) {
+           Tensor *style_a, Tensor *weight_a, Tensor *col_buffer, Tensor *skip_upsample_a, Tensor *skip_conv_a, Tensor *skip_a, cudaStream_t *streams) {
   ModulatedConv2d(input, style, modulate_weight, modulate_bias, conv_weight, kernel, output,
-                  style_a, weight_a, nullptr, col_buffer, nullptr, nullptr, nullptr, nullptr, false, false, 0, 2, nullptr);
+                  style_a, weight_a, nullptr, col_buffer, nullptr, nullptr, nullptr, nullptr, false, false, 0, 2, streams);
   addBias(output, conv_bias);
 
   if (skip != nullptr) {
