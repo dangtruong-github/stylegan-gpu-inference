@@ -33,40 +33,83 @@ void Tensor::aligned_free(void* ptr) {
 }
 
 // Constructor to allocate a zero-initialized tensor
-Tensor::Tensor(const std::vector<size_t> &shape_) {
+Tensor::Tensor(const std::vector<size_t> &shape_, bool malloc_copy_, cudaStream_t *streams) {
     ndim = shape_.size();
     for (size_t i = 0; i < ndim; i++) { shape[i] = shape_[i]; }
     size_t N_ = num_elem();
     size_t bytes = N_ * sizeof(float);
+    malloc_copy = malloc_copy_;
     
     buf = (float *) aligned_alloc(bytes);
     if (buf) {
         memset(buf, 0, bytes); // Explicitly zero the allocated memory
     }
+    
+    // Allocate device memory if host allocation was successful
+    if (buf) {
+        if (malloc_copy_) {
+            // copy data
+            replicate_to_all_devices();
+        } else {
+            malloc_device();
+            to_device(streams);
+        }
+    #ifdef FP16
+        if (malloc_copy_) {
+            // copy data
+            replicate_to_all_devices_fp16();
+        } else {
+            malloc_device_fp16();
+            to_device_fp16(streams);
+        }
+    #endif
+    }
 }
 
 // Constructor to allocate and copy from an existing buffer
-Tensor::Tensor(const std::vector<size_t> &shape_, float *buf_) {
+Tensor::Tensor(const std::vector<size_t> &shape_, float *buf_, bool malloc_copy_, cudaStream_t *streams) {
     ndim = shape_.size();
     for (size_t i = 0; i < ndim; i++) { shape[i] = shape_[i]; }
     size_t N_ = num_elem();
     size_t bytes = N_ * sizeof(float);
+    malloc_copy = malloc_copy_;
     
     buf = (float *) aligned_alloc(bytes);
     if (buf && buf_) {
         memcpy(buf, buf_, bytes);
+    }
+    
+    // Allocate device memory if host allocation was successful
+    if (buf) {
+        if (malloc_copy_) {
+            // copy data
+            replicate_to_all_devices();
+        } else {
+            malloc_device();
+            to_device(streams);
+        }
+    #ifdef FP16
+        if (malloc_copy_) {
+            // copy data
+            replicate_to_all_devices_fp16();
+        } else {
+            malloc_device_fp16();
+            to_device_fp16(streams);
+        }
+    #endif
     }
 }
 
 /* * Allocate batch by copying a single item along the batch dimension
 * i.e., shape=(2, 512, 4, 4) and buf_=(1, 512, 4, 4) -> allocate and copy buf_ twice.
 */
-Tensor::Tensor(const std::vector<size_t> &shape_, float *buf_, bool batch) {
+Tensor::Tensor(const std::vector<size_t> &shape_, float *buf_, bool batch, bool malloc_copy_, cudaStream_t *streams) {
     ndim = shape_.size();
     for (size_t i = 0; i < ndim; i++) { shape[i] = shape_[i]; }
     
     size_t N_ = num_elem();
     size_t bytes = N_ * sizeof(float);
+    malloc_copy = malloc_copy_;
     
     buf = (float *) aligned_alloc(bytes);
     
@@ -78,6 +121,26 @@ Tensor::Tensor(const std::vector<size_t> &shape_, float *buf_, bool batch) {
             float* destination_pointer = buf + (i * single_item_elements);
             memcpy(destination_pointer, buf_, single_item_bytes);
         }
+    }
+    
+    // Allocate device memory if host allocation was successful
+    if (buf) {
+        if (malloc_copy_) {
+            // copy data
+            replicate_to_all_devices();
+        } else {
+            malloc_device();
+            to_device(streams);
+        }
+    #ifdef FP16
+        if (malloc_copy_) {
+            // copy data
+            replicate_to_all_devices_fp16();
+        } else {
+            malloc_device_fp16();
+            to_device_fp16(streams);
+        }
+    #endif
     }
 }
 
@@ -131,6 +194,28 @@ void Tensor::printShape(const std::string& descr) {
 }
 
 /* GPU ALLOCATION AND FREE */ 
+
+// Example of replicating a tensor to all GPUs
+void Tensor::replicate_to_all_devices() {
+    // Note: Assumes h_buf (host buffer) is already allocated and filled
+    size_t total_elements = num_elem();
+    size_t total_bytes = total_elements * sizeof(float);
+
+    for (int i = 0; i < NUM_GPUS; i++) {
+        if (d_buf[i] != nullptr) continue; // Skip if already allocated
+
+        // Set the current CUDA device
+        CHECK_CUDA(cudaSetDevice(i));
+        
+        // 1. Allocate space for the ENTIRE tensor on this GPU
+        CHECK_CUDA(cudaMalloc((void**)&d_buf[i], total_bytes));
+
+        // 2. Copy the entire tensor from host to this GPU
+        CHECK_CUDA(cudaMemcpy(d_buf[i], buf, total_bytes, cudaMemcpyHostToDevice));
+    }
+
+    malloc_success = true;
+}
 
 // Allocate device memory (fp32) for 4 GPUs
 void Tensor::malloc_device() {
@@ -198,6 +283,42 @@ void Tensor::free_device() {
 }
 
 #ifdef FP16
+// Replicates host (fp32) tensor to all GPUs as fp16
+void Tensor::replicate_to_all_devices_fp16() {
+    // Assumes the primary host buffer `buf` (fp32) is already filled.
+    assert(buf != nullptr && "Host buffer is not allocated.");
+
+    size_t total_elements = num_elem();
+    size_t total_bytes_fp16 = total_elements * sizeof(half);
+
+    // 1. Create a temporary host buffer to hold the fp16 data.
+    // This conversion from fp32 to fp16 is done only ONCE.
+    half* temp_fp16_host = new half[total_elements];
+    for (size_t j = 0; j < total_elements; j++) {
+        temp_fp16_host[j] = __float2half(buf[j]);
+    }
+
+    // 2. Loop through each GPU to allocate memory and copy the data.
+    for (int i = 0; i < NUM_GPUS; i++) {
+        if (d_buf_fp16[i] != nullptr) continue; // Skip if already allocated
+
+        // Set the target CUDA device
+        CHECK_CUDA(cudaSetDevice(i));
+
+        // Allocate memory for the ENTIRE tensor on the current GPU
+        CHECK_CUDA(cudaMalloc((void**)&d_buf_fp16[i], total_bytes_fp16));
+
+        // Copy the converted fp16 data from the temporary host buffer to the current GPU
+        CHECK_CUDA(cudaMemcpy(d_buf_fp16[i], temp_fp16_host, total_bytes_fp16, cudaMemcpyHostToDevice));
+    }
+
+    // 3. Clean up the temporary host buffer
+    delete[] temp_fp16_host;
+    
+    // You might want a flag to indicate success
+    // malloc_success = true; 
+}
+
 // Allocate device memory (fp16) for 4 GPUs
 void Tensor::malloc_device_fp16() {
     size_t total_elements = num_elem();

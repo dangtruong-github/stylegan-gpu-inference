@@ -45,15 +45,15 @@ struct Tensor {
   float *buf = nullptr;
   float *d_buf[NUM_GPUS] = {};  // Device buffers for fp32 (one per GPU)
   bool malloc_success = false;
+  bool malloc_copy = false;
 
   #ifdef FP16
     half *d_buf_fp16[NUM_GPUS] = {};  // Device buffers for fp16 (one per GPU)
   #endif
 
-
-  Tensor(const vector<size_t> &shape_);
-  Tensor(const vector<size_t> &shape_, float *buf_);
-  Tensor(const vector<size_t> &shape_, float *buf_, bool batch);
+  Tensor(const vector<size_t> &shape_, bool malloc_copy_, cudaStream_t *streams);
+  Tensor(const vector<size_t> &shape_, float *buf_, bool malloc_copy_, cudaStream_t *streams);
+  Tensor(const vector<size_t> &shape_, float *buf_, bool batch, bool malloc_copy_, cudaStream_t *streams);
   ~Tensor();
 
   size_t num_elem();
@@ -64,12 +64,14 @@ struct Tensor {
   void* aligned_alloc(size_t size);
   void aligned_free(void* ptr);
 
+  void replicate_to_all_devices();
   void malloc_device();
   void to_device(cudaStream_t *streams);
   void from_device(cudaStream_t *streams);
   void free_device();
 
 #ifdef FP16
+  void replicate_to_all_devices_fp16();
   void malloc_device_fp16();
   void to_device_fp16(cudaStream_t *streams);
   void from_device_fp16(cudaStream_t *streams);
