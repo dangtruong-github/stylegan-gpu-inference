@@ -13,7 +13,6 @@ void Conv2d(Tensor *input, Tensor *weight, Tensor *output);
 void Conv2d_same(Tensor *input, Tensor *weight, Tensor *output,
             int stride, int pad, int dilation);
 
-void Conv2d_Optimized(Tensor *input, Tensor *weight, Tensor *output);
 void Conv2d_im2col(Tensor *input, Tensor *weight, Tensor *output, Tensor *col_buffer);
 
 void ConvTranspose2d_col2im(Tensor *input, Tensor *weight, Tensor *output,

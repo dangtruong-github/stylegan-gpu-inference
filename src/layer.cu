@@ -268,12 +268,14 @@ void bmm_wrapper(Tensor *A, Tensor *B, Tensor *C, bool A_to_device, bool B_to_de
 
   // 4. Time Data Movement From GPUs
   start_time = get_time_kernel();
-  if (C_from_device) C->from_device(streams);
+  if (C_from_device) {
+    C->from_device(streams);
   
-  // Block CPU until all data transfers are complete
-  for (int i = 0; i < NUM_GPUS; ++i) {
-      CHECK_CUDA(cudaSetDevice(i));
-      CHECK_CUDA(cudaStreamSynchronize(streams[i]));
+    // Block CPU until all data transfers are complete
+    for (int i = 0; i < NUM_GPUS; ++i) {
+        CHECK_CUDA(cudaSetDevice(i));
+        CHECK_CUDA(cudaStreamSynchronize(streams[i]));
+    }
   }
   end_time = get_time_kernel();
   from_device_time = end_time - start_time;
@@ -447,98 +449,100 @@ __global__ void transpose_kernel(const float* weight_data, float* transposed_dat
  * @param streams Array of CUDA streams, one for each GPU.
  */
 void im2col_wrapper(Tensor *input, Tensor *col_buffer, bool input_to_device, bool col_buffer_from_device, cudaStream_t *streams) {
-    // --- Timing variables ---
-    double func_start_time = get_time_kernel();
-    double start_time, end_time;
-    double to_device_time = 0.0;
-    double from_device_time = 0.0;
-    
-    cudaEvent_t start_events[NUM_GPUS];
-    cudaEvent_t stop_events[NUM_GPUS];
+  // --- Timing variables ---
+  double func_start_time = get_time_kernel();
+  double start_time, end_time;
+  double to_device_time = 0.0;
+  double from_device_time = 0.0;
+  
+  cudaEvent_t start_events[NUM_GPUS];
+  cudaEvent_t stop_events[NUM_GPUS];
+  for (int i = 0; i < NUM_GPUS; ++i) {
+      CHECK_CUDA(cudaSetDevice(i));
+      CHECK_CUDA(cudaEventCreate(&start_events[i]));
+      CHECK_CUDA(cudaEventCreate(&stop_events[i]));
+  }
+
+  // 1. Time Data Movement To GPUs
+  start_time = get_time_kernel();
+  if (input_to_device) input->to_device(streams);
+  for (int i = 0; i < NUM_GPUS; ++i) {
+      CHECK_CUDA(cudaSetDevice(i));
+      CHECK_CUDA(cudaStreamSynchronize(streams[i]));
+  }
+  end_time = get_time_kernel();
+  to_device_time = end_time - start_time;
+
+  // 2. Get dimensions from tensor shapes
+  const size_t N = input->shape[0];
+  const size_t C = input->shape[1];
+  const size_t H = input->shape[2];
+  const size_t W = input->shape[3];
+  const size_t batch_per_gpu = N / NUM_GPUS;
+
+  // 3. Time Kernel Execution
+  for (int gpu_id = 0; gpu_id < NUM_GPUS; ++gpu_id) {
+      CHECK_CUDA(cudaSetDevice(gpu_id));
+      CHECK_CUDA(cudaEventRecord(start_events[gpu_id], streams[gpu_id]));
+      
+      long long total_elements_gpu = (long long)batch_per_gpu * C * 3 * 3 * H * W;
+      int blockSize = 256;
+      int gridSize = (total_elements_gpu + blockSize - 1) / blockSize;
+      
+      im2col_kernel<<<gridSize, blockSize, 0, streams[gpu_id]>>>(
+          input->d_buf[gpu_id], 
+          col_buffer->d_buf[gpu_id], 
+          batch_per_gpu, C, H, W
+      );
+      CHECK_CUDA(cudaGetLastError());
+      CHECK_CUDA(cudaEventRecord(stop_events[gpu_id], streams[gpu_id]));
+  }
+  
+  float max_kernel_time_ms = 0.0f;
+  for (int i = 0; i < NUM_GPUS; ++i) {
+      float current_gpu_time_ms = 0.0f;
+      CHECK_CUDA(cudaSetDevice(i));
+      CHECK_CUDA(cudaEventSynchronize(stop_events[i]));
+      CHECK_CUDA(cudaEventElapsedTime(&current_gpu_time_ms, start_events[i], stop_events[i]));
+      if (current_gpu_time_ms > max_kernel_time_ms) {
+          max_kernel_time_ms = current_gpu_time_ms;
+      }
+  }
+  double kernel_exec_time_s = max_kernel_time_ms / 1000.0;
+
+  // 4. Time Data Movement From GPUs
+  start_time = get_time_kernel();
+  if (col_buffer_from_device) {
+    col_buffer->from_device(streams);
     for (int i = 0; i < NUM_GPUS; ++i) {
-        CHECK_CUDA(cudaSetDevice(i));
-        CHECK_CUDA(cudaEventCreate(&start_events[i]));
-        CHECK_CUDA(cudaEventCreate(&stop_events[i]));
+      CHECK_CUDA(cudaSetDevice(i));
+      CHECK_CUDA(cudaStreamSynchronize(streams[i]));
     }
+  }
+  end_time = get_time_kernel();
+  from_device_time = end_time - start_time;
 
-    // 1. Time Data Movement To GPUs
-    start_time = get_time_kernel();
-    if (input_to_device) input->to_device(streams);
-    for (int i = 0; i < NUM_GPUS; ++i) {
-        CHECK_CUDA(cudaSetDevice(i));
-        CHECK_CUDA(cudaStreamSynchronize(streams[i]));
-    }
-    end_time = get_time_kernel();
-    to_device_time = end_time - start_time;
+  // --- Cleanup & Final Performance Report ---
+  for (int i = 0; i < NUM_GPUS; ++i) {
+      CHECK_CUDA(cudaSetDevice(i));
+      CHECK_CUDA(cudaEventDestroy(start_events[i]));
+      CHECK_CUDA(cudaEventDestroy(stop_events[i]));
+  }
+  CHECK_CUDA(cudaSetDevice(0));
 
-    // 2. Get dimensions from tensor shapes
-    const size_t N = input->shape[0];
-    const size_t C = input->shape[1];
-    const size_t H = input->shape[2];
-    const size_t W = input->shape[3];
-    const size_t batch_per_gpu = N / NUM_GPUS;
-
-    // 3. Time Kernel Execution
-    for (int gpu_id = 0; gpu_id < NUM_GPUS; ++gpu_id) {
-        CHECK_CUDA(cudaSetDevice(gpu_id));
-        CHECK_CUDA(cudaEventRecord(start_events[gpu_id], streams[gpu_id]));
-        
-        long long total_elements_gpu = (long long)batch_per_gpu * C * 3 * 3 * H * W;
-        int blockSize = 256;
-        int gridSize = (total_elements_gpu + blockSize - 1) / blockSize;
-        
-        im2col_kernel<<<gridSize, blockSize, 0, streams[gpu_id]>>>(
-            input->d_buf[gpu_id], 
-            col_buffer->d_buf[gpu_id], 
-            batch_per_gpu, C, H, W
-        );
-        CHECK_CUDA(cudaGetLastError());
-        CHECK_CUDA(cudaEventRecord(stop_events[gpu_id], streams[gpu_id]));
-    }
-    
-    float max_kernel_time_ms = 0.0f;
-    for (int i = 0; i < NUM_GPUS; ++i) {
-        float current_gpu_time_ms = 0.0f;
-        CHECK_CUDA(cudaSetDevice(i));
-        CHECK_CUDA(cudaEventSynchronize(stop_events[i]));
-        CHECK_CUDA(cudaEventElapsedTime(&current_gpu_time_ms, start_events[i], stop_events[i]));
-        if (current_gpu_time_ms > max_kernel_time_ms) {
-            max_kernel_time_ms = current_gpu_time_ms;
-        }
-    }
-    double kernel_exec_time_s = max_kernel_time_ms / 1000.0;
-
-    // 4. Time Data Movement From GPUs
-    start_time = get_time_kernel();
-    if (col_buffer_from_device) col_buffer->from_device(streams);
-    for (int i = 0; i < NUM_GPUS; ++i) {
-        CHECK_CUDA(cudaSetDevice(i));
-        CHECK_CUDA(cudaStreamSynchronize(streams[i]));
-    }
-    end_time = get_time_kernel();
-    from_device_time = end_time - start_time;
-
-    // --- Cleanup & Final Performance Report ---
-    for (int i = 0; i < NUM_GPUS; ++i) {
-        CHECK_CUDA(cudaSetDevice(i));
-        CHECK_CUDA(cudaEventDestroy(start_events[i]));
-        CHECK_CUDA(cudaEventDestroy(stop_events[i]));
-    }
-    CHECK_CUDA(cudaSetDevice(0));
-
-    double total_func_time = get_time_kernel() - func_start_time;
-    double sum_of_parts = to_device_time + kernel_exec_time_s + from_device_time;
-    
-    printf("\n--- im2col_wrapper (Multi-GPU) Timing Report ---\n");
-    printf("Total Function Time         : %.6f s\n", total_func_time);
-    printf("--------------------------------------------\n");
-    printf("  - Data Transfer To GPUs   : %.6f s\n", to_device_time);
-    printf("  - Kernel Execution (Max)  : %.6f s\n", kernel_exec_time_s);
-    printf("  - Data Transfer From GPUs : %.6f s\n", from_device_time);
-    printf("--------------------------------------------\n");
-    printf("Sum of Timed Parts          : %.6f s\n", sum_of_parts);
-    printf("Unaccounted CPU Overhead    : %.6f s\n", total_func_time - sum_of_parts);
-    printf("--- End of Report ---\n\n");
+  double total_func_time = get_time_kernel() - func_start_time;
+  double sum_of_parts = to_device_time + kernel_exec_time_s + from_device_time;
+  
+  printf("\n--- im2col_wrapper (Multi-GPU) Timing Report ---\n");
+  printf("Total Function Time         : %.6f s\n", total_func_time);
+  printf("--------------------------------------------\n");
+  printf("  - Data Transfer To GPUs   : %.6f s\n", to_device_time);
+  printf("  - Kernel Execution (Max)  : %.6f s\n", kernel_exec_time_s);
+  printf("  - Data Transfer From GPUs : %.6f s\n", from_device_time);
+  printf("--------------------------------------------\n");
+  printf("Sum of Timed Parts          : %.6f s\n", sum_of_parts);
+  printf("Unaccounted CPU Overhead    : %.6f s\n", total_func_time - sum_of_parts);
+  printf("--- End of Report ---\n\n");
 }
 
 
@@ -553,103 +557,105 @@ void im2col_wrapper(Tensor *input, Tensor *col_buffer, bool input_to_device, boo
  * @param streams Array of CUDA streams, one for each GPU.
  */
 void col2im_wrapper(Tensor *col_buffer, Tensor *output, int H, int W, bool col_buffer_to_device, bool output_from_device, cudaStream_t *streams) {
-    // --- Timing variables ---
-    double func_start_time = get_time_kernel();
-    double start_time, end_time;
-    double to_device_time = 0.0;
-    double from_device_time = 0.0;
-    
-    cudaEvent_t start_events[NUM_GPUS];
-    cudaEvent_t stop_events[NUM_GPUS];
+  // --- Timing variables ---
+  double func_start_time = get_time_kernel();
+  double start_time, end_time;
+  double to_device_time = 0.0;
+  double from_device_time = 0.0;
+  
+  cudaEvent_t start_events[NUM_GPUS];
+  cudaEvent_t stop_events[NUM_GPUS];
+  for (int i = 0; i < NUM_GPUS; ++i) {
+      CHECK_CUDA(cudaSetDevice(i));
+      CHECK_CUDA(cudaEventCreate(&start_events[i]));
+      CHECK_CUDA(cudaEventCreate(&stop_events[i]));
+  }
+
+  // 1. Time Data Movement To GPUs
+  start_time = get_time_kernel();
+  if (col_buffer_to_device) col_buffer->to_device(streams);
+  for (int i = 0; i < NUM_GPUS; ++i) {
+      CHECK_CUDA(cudaSetDevice(i));
+      CHECK_CUDA(cudaStreamSynchronize(streams[i]));
+  }
+  end_time = get_time_kernel();
+  to_device_time = end_time - start_time;
+
+  // 2. Get dimensions from tensor shapes
+  const size_t N = output->shape[0];
+  const size_t K = output->shape[1];
+  const size_t OH = output->shape[2];
+  const size_t OW = output->shape[3];
+  const size_t batch_per_gpu = N / NUM_GPUS;
+
+  // 3. Time Kernel Execution
+  for (int gpu_id = 0; gpu_id < NUM_GPUS; ++gpu_id) {
+      CHECK_CUDA(cudaSetDevice(gpu_id));
+      
+      // IMPORTANT: Initialize output buffer on GPU to zeros before atomic additions
+      size_t output_bytes_per_gpu = batch_per_gpu * K * OH * OW * sizeof(float);
+      CHECK_CUDA(cudaMemsetAsync(output->d_buf[gpu_id], 0, output_bytes_per_gpu, streams[gpu_id]));
+
+      CHECK_CUDA(cudaEventRecord(start_events[gpu_id], streams[gpu_id]));
+      
+      long long total_elements_gpu = (long long)batch_per_gpu * K * 3 * 3 * H * W;
+      int blockSize = 256;
+      int gridSize = (total_elements_gpu + blockSize - 1) / blockSize;
+      
+      col2im_kernel<<<gridSize, blockSize, 0, streams[gpu_id]>>>(
+          col_buffer->d_buf[gpu_id],
+          output->d_buf[gpu_id],
+          batch_per_gpu, K, OH, OW, H, W
+      );
+      CHECK_CUDA(cudaGetLastError());
+      CHECK_CUDA(cudaEventRecord(stop_events[gpu_id], streams[gpu_id]));
+  }
+  
+  float max_kernel_time_ms = 0.0f;
+  for (int i = 0; i < NUM_GPUS; ++i) {
+      float current_gpu_time_ms = 0.0f;
+      CHECK_CUDA(cudaSetDevice(i));
+      CHECK_CUDA(cudaEventSynchronize(stop_events[i]));
+      CHECK_CUDA(cudaEventElapsedTime(&current_gpu_time_ms, start_events[i], stop_events[i]));
+      if (current_gpu_time_ms > max_kernel_time_ms) {
+          max_kernel_time_ms = current_gpu_time_ms;
+      }
+  }
+  double kernel_exec_time_s = max_kernel_time_ms / 1000.0;
+
+  // 4. Time Data Movement From GPUs
+  start_time = get_time_kernel();
+  if (output_from_device) {
+    output->from_device(streams);
     for (int i = 0; i < NUM_GPUS; ++i) {
-        CHECK_CUDA(cudaSetDevice(i));
-        CHECK_CUDA(cudaEventCreate(&start_events[i]));
-        CHECK_CUDA(cudaEventCreate(&stop_events[i]));
+      CHECK_CUDA(cudaSetDevice(i));
+      CHECK_CUDA(cudaStreamSynchronize(streams[i]));
     }
+  }
+  end_time = get_time_kernel();
+  from_device_time = end_time - start_time;
 
-    // 1. Time Data Movement To GPUs
-    start_time = get_time_kernel();
-    if (col_buffer_to_device) col_buffer->to_device(streams);
-    for (int i = 0; i < NUM_GPUS; ++i) {
-        CHECK_CUDA(cudaSetDevice(i));
-        CHECK_CUDA(cudaStreamSynchronize(streams[i]));
-    }
-    end_time = get_time_kernel();
-    to_device_time = end_time - start_time;
+  // --- Cleanup & Final Performance Report ---
+  for (int i = 0; i < NUM_GPUS; ++i) {
+      CHECK_CUDA(cudaSetDevice(i));
+      CHECK_CUDA(cudaEventDestroy(start_events[i]));
+      CHECK_CUDA(cudaEventDestroy(stop_events[i]));
+  }
+  CHECK_CUDA(cudaSetDevice(0));
 
-    // 2. Get dimensions from tensor shapes
-    const size_t N = output->shape[0];
-    const size_t K = output->shape[1];
-    const size_t OH = output->shape[2];
-    const size_t OW = output->shape[3];
-    const size_t batch_per_gpu = N / NUM_GPUS;
-
-    // 3. Time Kernel Execution
-    for (int gpu_id = 0; gpu_id < NUM_GPUS; ++gpu_id) {
-        CHECK_CUDA(cudaSetDevice(gpu_id));
-        
-        // IMPORTANT: Initialize output buffer on GPU to zeros before atomic additions
-        size_t output_bytes_per_gpu = batch_per_gpu * K * OH * OW * sizeof(float);
-        CHECK_CUDA(cudaMemsetAsync(output->d_buf[gpu_id], 0, output_bytes_per_gpu, streams[gpu_id]));
-
-        CHECK_CUDA(cudaEventRecord(start_events[gpu_id], streams[gpu_id]));
-        
-        long long total_elements_gpu = (long long)batch_per_gpu * K * 3 * 3 * H * W;
-        int blockSize = 256;
-        int gridSize = (total_elements_gpu + blockSize - 1) / blockSize;
-        
-        col2im_kernel<<<gridSize, blockSize, 0, streams[gpu_id]>>>(
-            col_buffer->d_buf[gpu_id],
-            output->d_buf[gpu_id],
-            batch_per_gpu, K, OH, OW, H, W
-        );
-        CHECK_CUDA(cudaGetLastError());
-        CHECK_CUDA(cudaEventRecord(stop_events[gpu_id], streams[gpu_id]));
-    }
-    
-    float max_kernel_time_ms = 0.0f;
-    for (int i = 0; i < NUM_GPUS; ++i) {
-        float current_gpu_time_ms = 0.0f;
-        CHECK_CUDA(cudaSetDevice(i));
-        CHECK_CUDA(cudaEventSynchronize(stop_events[i]));
-        CHECK_CUDA(cudaEventElapsedTime(&current_gpu_time_ms, start_events[i], stop_events[i]));
-        if (current_gpu_time_ms > max_kernel_time_ms) {
-            max_kernel_time_ms = current_gpu_time_ms;
-        }
-    }
-    double kernel_exec_time_s = max_kernel_time_ms / 1000.0;
-
-    // 4. Time Data Movement From GPUs
-    start_time = get_time_kernel();
-    if (output_from_device) output->from_device(streams);
-    for (int i = 0; i < NUM_GPUS; ++i) {
-        CHECK_CUDA(cudaSetDevice(i));
-        CHECK_CUDA(cudaStreamSynchronize(streams[i]));
-    }
-    end_time = get_time_kernel();
-    from_device_time = end_time - start_time;
-
-    // --- Cleanup & Final Performance Report ---
-    for (int i = 0; i < NUM_GPUS; ++i) {
-        CHECK_CUDA(cudaSetDevice(i));
-        CHECK_CUDA(cudaEventDestroy(start_events[i]));
-        CHECK_CUDA(cudaEventDestroy(stop_events[i]));
-    }
-    CHECK_CUDA(cudaSetDevice(0));
-
-    double total_func_time = get_time_kernel() - func_start_time;
-    double sum_of_parts = to_device_time + kernel_exec_time_s + from_device_time;
-    
-    printf("\n--- col2im_wrapper (Multi-GPU) Timing Report ---\n");
-    printf("Total Function Time         : %.6f s\n", total_func_time);
-    printf("--------------------------------------------\n");
-    printf("  - Data Transfer To GPUs   : %.6f s\n", to_device_time);
-    printf("  - Kernel Execution (Max)  : %.6f s\n", kernel_exec_time_s);
-    printf("  - Data Transfer From GPUs : %.6f s\n", from_device_time);
-    printf("--------------------------------------------\n");
-    printf("Sum of Timed Parts          : %.6f s\n", sum_of_parts);
-    printf("Unaccounted CPU Overhead    : %.6f s\n", total_func_time - sum_of_parts);
-    printf("--- End of Report ---\n\n");
+  double total_func_time = get_time_kernel() - func_start_time;
+  double sum_of_parts = to_device_time + kernel_exec_time_s + from_device_time;
+  
+  printf("\n--- col2im_wrapper (Multi-GPU) Timing Report ---\n");
+  printf("Total Function Time         : %.6f s\n", total_func_time);
+  printf("--------------------------------------------\n");
+  printf("  - Data Transfer To GPUs   : %.6f s\n", to_device_time);
+  printf("  - Kernel Execution (Max)  : %.6f s\n", kernel_exec_time_s);
+  printf("  - Data Transfer From GPUs : %.6f s\n", from_device_time);
+  printf("--------------------------------------------\n");
+  printf("Sum of Timed Parts          : %.6f s\n", sum_of_parts);
+  printf("Unaccounted CPU Overhead    : %.6f s\n", total_func_time - sum_of_parts);
+  printf("--- End of Report ---\n\n");
 }
 
 
@@ -726,10 +732,12 @@ void transpose_wrapper(Tensor *weight, Tensor *weight_transpose, bool weight_to_
 
     // 4. Time Data Movement From GPUs
     start_time = get_time_kernel();
-    if (transpose_from_device) weight_transpose->from_device(streams);
-    for (int i = 0; i < NUM_GPUS; ++i) {
+    if (transpose_from_device) {
+      weight_transpose->from_device(streams);
+      for (int i = 0; i < NUM_GPUS; ++i) {
         CHECK_CUDA(cudaSetDevice(i));
         CHECK_CUDA(cudaStreamSynchronize(streams[i]));
+      }
     }
     end_time = get_time_kernel();
     from_device_time = end_time - start_time;
@@ -757,286 +765,6 @@ void transpose_wrapper(Tensor *weight, Tensor *weight_transpose, bool weight_to_
     printf("--- End of Report ---\n\n");
 }
 
-/**
- * @brief Transforms image patches into a column matrix (transposed layout).
- * This is a highly optimized version for large H and W.
- * @param input The input tensor of shape (N, C, H, W).
- * @param col_buffer The output buffer with shape (N, C*R*S, OH*OW).
- * @param R Kernel height.
- * @param S Kernel width.
- * @param stride The convolution stride.
- * @param pad The convolution padding.
- * @param dilation The convolution dilation.
- */
-void im2col(Tensor* input, Tensor* col_buffer) {
-  // Input tensor dimensions
-  size_t N = input->shape[0];
-  size_t C = input->shape[1];
-  size_t H = input->shape[2];
-  size_t W = input->shape[3];
-
-  // Calculate effective kernel size with dilation
-  size_t R = 3, S = 3;
-  
-  // Get dimensions from the col_buffer's shape
-  size_t CRS_col = col_buffer->shape[1]; // C * R * S
-  size_t HW_col = col_buffer->shape[2];  // OH * OW
-
-  // 2. --- Optimization: Parallelization (over batch 'N') ---
-  // The loop over batch items is embarrassingly parallel.
-  for (size_t n = 0; n < N; ++n) {
-    // Pointer to the start of the nth item in the input buffer
-    const float* input_n = input->buf + n * C * H * W;
-    // Pointer to the start of the nth item in the output column buffer
-    float* col_buffer_n = col_buffer->buf + n * CRS_col * HW_col;
-
-    // 3. --- Optimization: Loop Reordering & Tiling ---
-    // We iterate through channels first, then output locations.
-    // Tiling is applied to the output width (w_col) to improve L1/L2 cache re-use.
-    #pragma omp parallel for collapse(2) num_threads(NUM_THREADS_MAT_MUL)
-    for (size_t c = 0; c < C; ++c) {
-      for (size_t h_col = 0; h_col < H; ++h_col) {
-        for (size_t w_block_start = 0; w_block_start < W; w_block_start += TILE_W_IM2COL) {
-          size_t w_block_end = min(w_block_start + TILE_W_IM2COL, W);
-
-          for (size_t w_col = w_block_start; w_col < w_block_end; ++w_col) {
-
-            // This is now the "hot loop". It processes one entire input patch.
-            // By iterating `r` and `s` here, we ensure reads from `input`
-            // are localized to a small window, maximizing cache hits.
-            for (size_t r = 0; r < R; ++r) {
-              int input_h = h_col + r - 1;
-
-              for (size_t s = 0; s < S; ++s) {
-                int input_w = w_col + s - 1;
-                
-                // The bounds check is still needed, but the 'else' is gone.
-                if (input_h >= 0 && input_h < H && input_w >= 0 && input_w < W) {
-                  // Calculate source and destination indices
-                  size_t src_idx = c * H * W + input_h * W + input_w;
-                  size_t dest_idx = (c * R * S + r * S + s) * HW_col + (h_col * W + w_col);
-                  
-                  col_buffer_n[dest_idx] = input_n[src_idx];
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-}
-
-// --- Recommendation #3 & #9: Configure wider H/W tiles for cache blocking ---
-#ifndef TILE_SIZE_H
-#define TILE_SIZE_H 64
-#endif
-#ifndef TILE_SIZE_W
-#define TILE_SIZE_W 256
-#endif
-
-/**
- * @brief Transforms image patches into a column matrix (specialized for 3x3, s=1, p=1).
- *
- * This is a highly optimized AVX2 version specifically for a 3x3 kernel with
- * stride=1, pad=1, and dilation=1. These fixed parameters simplify output dimension
- * calculations (OH=H, OW=W) and remove the need for general-purpose logic,
- * resulting in a faster, more streamlined implementation.
- *
- * @param input The input tensor of shape (N, C, H, W).
- * @param col_buffer The output buffer, pre-allocated with shape (N, C*9, H*W).
- */
-void im2col_3x3_s1_p1_avx2(const Tensor* input, Tensor* col_buffer) {
-    // Input dimensions
-    const size_t N = input->shape[0], C = input->shape[1], H = input->shape[2], W = input->shape[3];
-    
-    // Hardcoded parameters for this specialized function
-    constexpr size_t R = 3, S = 3;
-    constexpr size_t KERNEL_SIZE = R * S; // Becomes 9
-
-    // With stride=1, pad=1, dilation=1 for a 3x3 kernel, OH=H and OW=W.
-    const size_t OH = H;
-    const size_t OW = W;
-    const size_t COL_WIDTH = OH * OW;
-    const size_t COL_HEIGHT = C * KERNEL_SIZE;
-
-    // --- Recommendation #5: Parallelize over larger grains (batch N x channels C) ---
-    #pragma omp parallel for collapse(2)
-    for (size_t n = 0; n < N; ++n) {
-        for (size_t c = 0; c < C; ++c) {
-            const float* input_c = input->buf + (n * C + c) * H * W;
-            float* col_buffer_c = col_buffer->buf + (n * COL_HEIGHT + c * KERNEL_SIZE) * COL_WIDTH;
-
-            // --- Recommendation #8: Separate pass for zero padding ---
-            // memset(col_buffer_c, 0, KERNEL_SIZE * COL_WIDTH * sizeof(float));
-            
-            // --- Recommendation #1: Define interior region to avoid bounds checks ---
-            // For a 3x3 kernel with pad=1, the interior (non-padded) region of the
-            // output is from (1, 1) to (H-2, W-2).
-            const int h_col_interior_start = 1;
-            const int h_col_interior_end = H - 1;
-            const int w_col_interior_start = 1;
-            const int w_col_interior_end = W - 1;
-
-            // SLOW PATH: Generic lambda to process border patches where checks are required.
-            auto process_border_patch = [&](int h_col, int w_col) {
-                const int h_in_start = h_col - 1; // pad=1
-                const int w_in_start = w_col - 1; // pad=1
-                size_t col_idx = h_col * OW + w_col;
-                for (size_t r = 0; r < R; ++r) {
-                    for (size_t s = 0; s < S; ++s) {
-                        int h_in = h_in_start + r;
-                        int w_in = w_in_start + s;
-                        if (h_in >= 0 && h_in < H && w_in >= 0 && w_in < W) {
-                            col_buffer_c[(r * S + s) * COL_WIDTH + col_idx] = input_c[h_in * W + w_in];
-                        }
-                    }
-                }
-            };
-            
-            // Process all border regions using the slow path
-            for (int h = 0; h < OH; ++h) {
-                if (h < h_col_interior_start || h >= h_col_interior_end) {
-                    for (int w = 0; w < OW; ++w) process_border_patch(h, w);
-                } else {
-                    for (int w = 0; w < w_col_interior_start; ++w) process_border_patch(h, w);
-                    for (int w = w_col_interior_end; w < OW; ++w) process_border_patch(h, w);
-                }
-            }
-            
-            // --- FAST PATH (HOT LOOP): Process the interior region ---
-            for (int h_tile = h_col_interior_start; h_tile < h_col_interior_end; h_tile += TILE_SIZE_H) {
-                for (int w_tile = w_col_interior_start; w_tile < w_col_interior_end; w_tile += TILE_SIZE_W) {
-                    const int h_tile_end = min(h_tile + TILE_SIZE_H, h_col_interior_end);
-                    const int w_tile_end = min(w_tile + TILE_SIZE_W, w_col_interior_end);
-                    
-                    for (size_t r = 0; r < R; ++r) {
-                        for (size_t s = 0; s < S; ++s) {
-                            float* col_ptr_base = col_buffer_c + (r * S + s) * COL_WIDTH;
-
-                            for (int h_col = h_tile; h_col < h_tile_end; ++h_col) {
-                                // --- Rec #7: Simplified index calculations ---
-                                const int h_in = h_col - 1 + r;
-                                const float* input_ptr = input_c + h_in * W + (w_tile - 1 + s);
-                                float* col_ptr = col_ptr_base + h_col * OW + w_tile;
-                                
-                                int w_col = w_tile;
-
-                                // --- Rec #4: Vectorize along w_col for 8 elements at a time ---
-                                // Since stride=1 and dilation=1, memory access is contiguous.
-                                int w_col_end_avx = w_tile + ((w_tile_end - w_tile) / 8) * 8;
-                                for (; w_col < w_col_end_avx; w_col += 8) {
-                                    _mm256_storeu_ps(col_ptr, _mm256_loadu_ps(input_ptr));
-                                    input_ptr += 8;
-                                    col_ptr += 8;
-                                }
-                                
-                                // Scalar cleanup for remaining elements
-                                for (; w_col < w_tile_end; ++w_col) {
-                                    *col_ptr++ = *input_ptr++;
-                                }
-                            }
-                        }
-                    }
-                }
-            } // End of fast path
-        } // End of parallel channel loop
-    } // End of batch loop
-}
-
-/**
- * @brief Transforms a column buffer back into an image tensor (transposed convolution).
- * * @param col_buffer Input column buffer with shape (N, K*R*S, H*W).
- * @param output The output tensor with shape (N, K, OH, OW) to be filled.
- * @param H Input height.
- * @param W Input width.
- * @param R Kernel height.
- * @param S Kernel width.
- * @param stride Convolution stride.
- * @param pad Convolution padding.
- */
-void col2im(Tensor *col_buffer, Tensor *output, int H, int W) {
-  // Extract dimensions for clarity
-  const int N = output->shape[0];
-  const int K = output->shape[1];
-  const int OH = output->shape[2];
-  const int OW = output->shape[3];
-
-  const int KRS = K * 9;
-  const int HW = H * W;
-
-  // Initialize the output tensor with zeros. This is crucial.
-  memset(output->buf, 0, N * K * OH * OW * sizeof(float));
-
-  // Iterate through each element in the column buffer
-  #pragma omp parallel for collapse(3)
-  for (int n = 0; n < N; ++n) {
-    for (int krs = 0; krs < KRS; ++krs) {
-      for (int hw = 0; hw < HW; ++hw) {
-        // Deconstruct the indices
-        const int k = krs / 9;
-        const int r = (krs % 9) / 3;
-        const int s = krs % 3;
-
-        const int h = hw / W;
-        const int w = hw % W;
-
-        // Calculate the target coordinates in the output image
-        // This is the core formula for the "scattering" operation
-        const int oh = h * 2 + r;
-        const int ow = w * 2 + s;
-        
-        // Check if the calculated coordinates are within the output tensor's bounds
-        if (oh < OH && ow < OW) {
-          // Calculate flat indices
-          const int col_idx = n * (KRS * HW) + krs * HW + hw;
-          const int output_idx = n * (K * OH * OW) + k * (OH * OW) + oh * OW + ow;
-          
-          // Add the value from the column buffer to the output image.
-          // We use addition because multiple values can map to the same output pixel.
-          output->buf[output_idx] += col_buffer->buf[col_idx];
-        }
-      }
-    }
-  }
-}
-
-/**
- * @brief Transposes a 5D tensor from shape (N, K, C, R, S) to (N, K, R, S, C).
- * * @param weight The input tensor with shape (N, K, C, R, S).
- * @param weight_transpose The output tensor to store the result, with shape (N, K, R, S, C).
- */
-void transpose(Tensor *weight, Tensor *weight_transpose) {
-  // Extract dimensions for clarity
-  const int N = weight->shape[0];
-  const int K = weight->shape[1];
-  const int C = weight->shape[2];
-  const int R = weight->shape[3];
-  const int S = weight->shape[4];
-
-  // Iterate through each element of the input tensor
-  #pragma omp parallel for collapse(5) num_threads(NUM_THREADS_MAT_MUL)
-  for (int n = 0; n < N; ++n) {
-    for (int k = 0; k < K; ++k) {
-      for (int c = 0; c < C; ++c) {
-        for (int r = 0; r < R; ++r) {
-          for (int s = 0; s < S; ++s) {
-            // Calculate the source index in the original tensor (row-major)
-            int src_idx = n * (K * C * R * S) + k * (C * R * S) + 
-                          c * (R * S) + r * S + s;
-
-            // Calculate the destination index in the transposed tensor (row-major)
-            int dst_idx = n * (K * R * S * C) + k * (R * S * C) + 
-                          r * (S * C) + s * C + c;
-            
-            // Copy the element
-            weight_transpose->buf[dst_idx] = weight->buf[src_idx];
-          }
-        }
-      }
-    }
-  }
-}
 
 // -------------- MAIN FUNCTION ---------------------
 
@@ -1491,183 +1219,6 @@ void Conv2d_same(Tensor *input, Tensor *weight, Tensor *output,
 }
 
 /*
- * Convolution (with per-sample weights) - Optimized for stride=1, pad=1, dilation=1 and a 3x3 kernel
- *
- * This version fully unrolls the loops over the 3x3 kernel dimensions (R and S) to
- * eliminate loop overhead and maximize instruction-level parallelism.
- *
- * CONSTRAINT: K is a multiple of 64. We will unroll by 4.
- * pad = 1, dilation = 1, stride = 1
- */
-void Conv2d_Optimized(Tensor *input, Tensor *weight, Tensor *output) {
-  // --- Timing variables ---
-  double func_start_time = get_time_kernel();
-  // --- End of Timing variables ---
-
-  size_t N = input->shape[0], C = input->shape[1], H = input->shape[2], W = input->shape[3];
-  size_t K = weight->shape[1];
-  const int R = 3, S = 3;
-  const int KERNEL_SIZE = R * S; // Will be 9
-
-  size_t OH = output->shape[2], OW = output->shape[3];
-
-  const int VEC_LEN_128 = 4;
-  const int K_UNROLL = 4;
-
-  const size_t input_n_stride = C * H * W;
-  const size_t weight_n_stride = K * C * KERNEL_SIZE;
-  const size_t output_n_stride = K * OH * OW;
-  const size_t weight_k_stride = C * KERNEL_SIZE;
-  const size_t output_k_stride = OH * OW;
-
-  memset(output->buf, 0, N * K * OH * OW * sizeof(float));
-
-  #pragma omp parallel for collapse(2)
-  for (size_t n = 0; n < N; ++n) {
-    for (size_t k_base = 0; k_base < K; k_base += K_UNROLL) {
-      const float* p_input_n = input->buf + n * input_n_stride;
-
-      float* p_output_nk[K_UNROLL];
-      for (int i = 0; i < K_UNROLL; ++i) {
-        p_output_nk[i] = output->buf + n * output_n_stride + (k_base + i) * output_k_stride;
-      }
-
-      const float* p_weight_nk[K_UNROLL];
-      for (int i = 0; i < K_UNROLL; ++i) {
-        p_weight_nk[i] = weight->buf + n * weight_n_stride + (k_base + i) * weight_k_stride;
-      }
-
-      // Loop over input channels is now the outer loop
-      for (size_t c = 0; c < C; ++c) {
-        const float* p_input_c = p_input_n + c * H * W;
-        const float* p_weight_c[K_UNROLL];
-        for (int i = 0; i < K_UNROLL; ++i) {
-          p_weight_c[i] = p_weight_nk[i] + c * KERNEL_SIZE;
-        }
-
-        if (OW >= VEC_LEN) {
-          // FAST PATH: OW is a multiple of 8. No boundary checks needed for width.
-          for (size_t oh = 0; oh < OH; ++oh) {
-            for (size_t ow = 0; ow < OW; ow += VEC_LEN) {
-              // Load is always safe and aligned
-              __m256 o_vec0 = _mm256_load_ps(p_output_nk[0] + oh * OW + ow);
-              __m256 o_vec1 = _mm256_load_ps(p_output_nk[1] + oh * OW + ow);
-              __m256 o_vec2 = _mm256_load_ps(p_output_nk[2] + oh * OW + ow);
-              __m256 o_vec3 = _mm256_load_ps(p_output_nk[3] + oh * OW + ow);
-
-              // V3 Optimization: Manually unroll the 3x3 kernel operations
-              #define LOAD_AND_FMA_256(r_offset, s_offset, weight_idx) \
-              { \
-                const int h_in = (int)oh - 1 + (r_offset); \
-                const int w_in_base = (int)ow - 1 + (s_offset); \
-                __m256 i_vec; \
-                if (h_in >= 0 && h_in < H && w_in_base >= 0 && w_in_base + VEC_LEN <= W) { \
-                  i_vec = _mm256_loadu_ps(p_input_c + h_in * W + w_in_base); \
-                } else { \
-                  float temp_i[VEC_LEN]; \
-                  for (int i = 0; i < VEC_LEN; ++i) { \
-                    const int w_in = w_in_base + i; \
-                    temp_i[i] = (h_in >= 0 && h_in < H && w_in >= 0 && w_in < W) \
-                                ? p_input_c[h_in * W + w_in] : 0.0f; \
-                  } \
-                  i_vec = _mm256_loadu_ps(temp_i); \
-                } \
-                __m256 w_vec0 = _mm256_set1_ps(p_weight_c[0][weight_idx]); \
-                o_vec0 = _mm256_fmadd_ps(i_vec, w_vec0, o_vec0); \
-                __m256 w_vec1 = _mm256_set1_ps(p_weight_c[1][weight_idx]); \
-                o_vec1 = _mm256_fmadd_ps(i_vec, w_vec1, o_vec1); \
-                __m256 w_vec2 = _mm256_set1_ps(p_weight_c[2][weight_idx]); \
-                o_vec2 = _mm256_fmadd_ps(i_vec, w_vec2, o_vec2); \
-                __m256 w_vec3 = _mm256_set1_ps(p_weight_c[3][weight_idx]); \
-                o_vec3 = _mm256_fmadd_ps(i_vec, w_vec3, o_vec3); \
-              }
-              
-              // Unroll 3x3 kernel
-              LOAD_AND_FMA_256(0, 0, 0); LOAD_AND_FMA_256(0, 1, 1); LOAD_AND_FMA_256(0, 2, 2);
-              LOAD_AND_FMA_256(1, 0, 3); LOAD_AND_FMA_256(1, 1, 4); LOAD_AND_FMA_256(1, 2, 5);
-              LOAD_AND_FMA_256(2, 0, 6); LOAD_AND_FMA_256(2, 1, 7); LOAD_AND_FMA_256(2, 2, 8);
-              
-              #undef LOAD_AND_FMA_256
-
-              // Store is always safe and aligned
-              _mm256_store_ps(p_output_nk[0] + oh * OW + ow, o_vec0);
-              _mm256_store_ps(p_output_nk[1] + oh * OW + ow, o_vec1);
-              _mm256_store_ps(p_output_nk[2] + oh * OW + ow, o_vec2);
-              _mm256_store_ps(p_output_nk[3] + oh * OW + ow, o_vec3);
-            }
-          }
-        } else {
-          // PATH 2: OW is exactly 4. Process with 128-bit vectors only.
-          for (size_t oh = 0; oh < OH; ++oh) {
-            // Since OW is 4, we only process one 128-bit vector at ow = 0
-            const size_t ow = 0;
-            
-            // Load the 4 output values. Address is 16-byte aligned.
-            __m128 o_vec0 = _mm_load_ps(p_output_nk[0] + oh * OW + ow);
-            __m128 o_vec1 = _mm_load_ps(p_output_nk[1] + oh * OW + ow);
-            __m128 o_vec2 = _mm_load_ps(p_output_nk[2] + oh * OW + ow);
-            __m128 o_vec3 = _mm_load_ps(p_output_nk[3] + oh * OW + ow);
-
-            #define LOAD_AND_FMA_128(r_offset, s_offset, weight_idx) \
-            { \
-              const int h_in = (int)oh - 1 + (r_offset); \
-              const int w_in_base = (int)ow - 1 + (s_offset); \
-              __m128 i_vec; \
-              if (h_in >= 0 && h_in < H && w_in_base >= 0 && w_in_base + VEC_LEN_128 <= W) { \
-                i_vec = _mm_loadu_ps(p_input_c + h_in * W + w_in_base); \
-              } else { \
-                float temp_i[VEC_LEN_128]; \
-                for (int i = 0; i < VEC_LEN_128; ++i) { \
-                  const int w_in = w_in_base + i; \
-                  temp_i[i] = (h_in >= 0 && h_in < H && w_in >= 0 && w_in < W) \
-                              ? p_input_c[h_in * W + w_in] : 0.0f; \
-                } \
-                i_vec = _mm_loadu_ps(temp_i); \
-              } \
-              __m128 w_vec0 = _mm_set1_ps(p_weight_c[0][weight_idx]); \
-              o_vec0 = _mm_fmadd_ps(i_vec, w_vec0, o_vec0); \
-              __m128 w_vec1 = _mm_set1_ps(p_weight_c[1][weight_idx]); \
-              o_vec1 = _mm_fmadd_ps(i_vec, w_vec1, o_vec1); \
-              __m128 w_vec2 = _mm_set1_ps(p_weight_c[2][weight_idx]); \
-              o_vec2 = _mm_fmadd_ps(i_vec, w_vec2, o_vec2); \
-              __m128 w_vec3 = _mm_set1_ps(p_weight_c[3][weight_idx]); \
-              o_vec3 = _mm_fmadd_ps(i_vec, w_vec3, o_vec3); \
-            }
-
-            // Unroll 3x3 kernel
-            LOAD_AND_FMA_128(0, 0, 0); LOAD_AND_FMA_128(0, 1, 1); LOAD_AND_FMA_128(0, 2, 2);
-            LOAD_AND_FMA_128(1, 0, 3); LOAD_AND_FMA_128(1, 1, 4); LOAD_AND_FMA_128(1, 2, 5);
-            LOAD_AND_FMA_128(2, 0, 6); LOAD_AND_FMA_128(2, 1, 7); LOAD_AND_FMA_128(2, 2, 8);
-            
-            #undef LOAD_AND_FMA_128
-
-            // Store the 4 updated output values
-            _mm_store_ps(p_output_nk[0] + oh * OW + ow, o_vec0);
-            _mm_store_ps(p_output_nk[1] + oh * OW + ow, o_vec1);
-            _mm_store_ps(p_output_nk[2] + oh * OW + ow, o_vec2);
-            _mm_store_ps(p_output_nk[3] + oh * OW + ow, o_vec3);
-          }
-        }
-      }
-    }
-  }
-
-  // --- Print Timing Results ---
-  double func_end_time = get_time_kernel();
-  double total_time = func_end_time - func_start_time;
-
-  /*
-  printf("\n--- Conv2d_Optimized Timing Report ---\n");
-  input->printShape("input");
-  weight->printShape("weight");
-  output->printShape("output");
-  printf("N: %zu, K: %zu, OH: %zu, OW: %zu, H: %zu, W: %zu, C: %zu\n", N, K, OH, OW, H, W, C);
-  printf("Total Function Time: %.6f s\n", total_time);
-  printf("--- End of Report ---\n\n");
-  */
-}
-
-/*
  * Convolution (with per-sample weights)
  * input shape = (N, C, H, W)
  * weight shape = (N, K, C, R, S)
@@ -1701,13 +1252,6 @@ void Conv2d_im2col(Tensor *input, Tensor *weight, Tensor *output, Tensor *col_bu
   // 3. ---- Call im2col to populate the provided buffer ----
   // This assumes `col_buffer` has a bmm-compatible shape of (N, OH*OW, C*R*S)
   start_time = get_time_kernel();
-  /*
-  if (OH >= 64) {
-    im2col_3x3_s1_p1_avx2(input, col_buffer);
-  } else {
-    im2col(input, col_buffer);
-  }
-  */
   im2col_wrapper(input, col_buffer, true, false, streams);
   end_time = get_time_kernel();
   im2col_time = end_time - start_time;
@@ -2112,11 +1656,7 @@ void ModulatedConv2d(Tensor *input, Tensor *style, Tensor *modulate_weight, Tens
       Conv2d(input, weight_a, output);
     } else {
       conv_path_taken = "Conv2d_Optimized";
-      if (input->shape[2] > 64) {
-        Conv2d_im2col(input, weight_a, output, col_buffer, streams);
-      } else {
-        Conv2d_Optimized(input, weight_a, output);
-      }
+      Conv2d_im2col(input, weight_a, output, col_buffer, streams);
     }
     end_time = get_time_kernel();
     conv2d_time = end_time - start_time;

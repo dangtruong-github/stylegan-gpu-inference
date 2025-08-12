@@ -236,36 +236,42 @@ void Tensor::malloc_device() {
     malloc_success = true;
 }
 
-// Copy host to device (fp32) for 4 GPUs
+// Copy host to device (fp32) for 4 GPUs using streams
 void Tensor::to_device(cudaStream_t *streams) {
     size_t total_elements = num_elem();
     size_t per_gpu_elements = total_elements / NUM_GPUS;
     size_t bytes_per_gpu = per_gpu_elements * sizeof(float);
+
+    // NOTE: For true asynchronous behavior, the host buffer 'buf' must be 
+    // allocated with pinned memory (e.g., using cudaMallocHost).
 
     // Ensure device memory is allocated
     // malloc_device();
 
     for (int i = 0; i < NUM_GPUS; i++) {
         CHECK_CUDA(cudaSetDevice(i));
-        // Copy the segment of host buffer for this GPU
+        // Asynchronously copy the segment of host buffer for this GPU on its respective stream
         float* host_segment = buf + i * per_gpu_elements;
-        CHECK_CUDA(cudaMemcpy(d_buf[i], host_segment, bytes_per_gpu, cudaMemcpyHostToDevice));
+        CHECK_CUDA(cudaMemcpyAsync(d_buf[i], host_segment, bytes_per_gpu, cudaMemcpyHostToDevice, streams[i]));
     }
 }
 
-// Copy device to host (fp32) for 4 GPUs
+// Copy device to host (fp32) for 4 GPUs using streams
 void Tensor::from_device(cudaStream_t *streams) {
     size_t total_elements = num_elem();
     size_t per_gpu_elements = total_elements / NUM_GPUS;
     size_t bytes_per_gpu = per_gpu_elements * sizeof(float);
 
+    // NOTE: For true asynchronous behavior, the host buffer 'buf' must be 
+    // allocated with pinned memory (e.g., using cudaMallocHost).
+
     for (int i = 0; i < NUM_GPUS; i++) {
         if (d_buf[i] == nullptr) continue; // Skip if not allocated
 
         CHECK_CUDA(cudaSetDevice(i));
-        // Copy the segment to the host buffer for this GPU
+        // Asynchronously copy the segment to the host buffer for this GPU on its respective stream
         float* host_segment = buf + i * per_gpu_elements;
-        CHECK_CUDA(cudaMemcpy(host_segment, d_buf[i], bytes_per_gpu, cudaMemcpyDeviceToHost));
+        CHECK_CUDA(cudaMemcpyAsync(host_segment, d_buf[i], bytes_per_gpu, cudaMemcpyDeviceToHost, streams[i]));
     }
 }
 
@@ -345,15 +351,18 @@ void Tensor::to_device_fp16(cudaStream_t *streams) {
     for (int i = 0; i < 4; i++) {
         float* host_segment = buf + i * per_gpu_elements;
         
-        // Convert host segment to fp16
+        // Convert host segment to fp16 on the CPU
         half* temp_fp16 = new half[per_gpu_elements];
         for (size_t j = 0; j < per_gpu_elements; j++) {
             temp_fp16[j] = __float2half(host_segment[j]);
         }
 
-        // Copy to device
+        // Asynchronously copy to device on the specified stream
         CHECK_CUDA(cudaSetDevice(i));
-        CHECK_CUDA(cudaMemcpy(d_buf_fp16[i], temp_fp16, per_gpu_elements * sizeof(half), cudaMemcpyHostToDevice));
+        CHECK_CUDA(cudaMemcpyAsync(d_buf_fp16[i], temp_fp16, per_gpu_elements * sizeof(half), cudaMemcpyHostToDevice, streams[i]));
+        
+        // CRITICAL: We must wait for the async copy to finish before deleting the host buffer.
+        CHECK_CUDA(cudaStreamSynchronize(streams[i]));
         
         delete[] temp_fp16;
     }
@@ -369,12 +378,16 @@ void Tensor::from_device_fp16(cudaStream_t *streams) {
     for (int i = 0; i < 4; i++) {
         if (d_buf_fp16[i] == nullptr) continue; // Skip if not allocated
 
-        // Copy device buffer to temporary host buffer
+        // Allocate temporary host buffer
         half* temp_fp16 = new half[per_gpu_elements];
         CHECK_CUDA(cudaSetDevice(i));
-        CHECK_CUDA(cudaMemcpy(temp_fp16, d_buf_fp16[i], per_gpu_elements * sizeof(half), cudaMemcpyDeviceToHost));
+        // Asynchronously copy device buffer to temporary host buffer on the specified stream
+        CHECK_CUDA(cudaMemcpyAsync(temp_fp16, d_buf_fp16[i], per_gpu_elements * sizeof(half), cudaMemcpyDeviceToHost, streams[i]));
 
-        // Convert to fp32 and copy to host buffer
+        // CRITICAL: We must wait for the async copy to arrive before reading the data on the CPU.
+        CHECK_CUDA(cudaStreamSynchronize(streams[i]));
+
+        // Convert to fp32 and copy to the final host buffer
         float* host_segment = buf + i * per_gpu_elements;
         for (size_t j = 0; j < per_gpu_elements; j++) {
             host_segment[j] = __half2float(temp_fp16[j]);
