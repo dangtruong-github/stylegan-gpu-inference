@@ -2,47 +2,218 @@
 #define min(x, y) ((x) < (y) ? (x) : (y))
 #define max(x, y) ((x) > (y) ? (x) : (y))
 
-#define ITILE 64
-#define JTILE 1024
-#define KTILE 64
+// Tiling parameters
+#define BLOCK_TILE_SIZE_X 128
+#define BLOCK_TILE_SIZE_Y 128
+#define BLOCK_TILE_SIZE_K 16
+#define WARP_TILE_SIZE_X 32
+#define WARP_TILE_SIZE_Y 64
+#define THREAD_TILE_SIZE_X 8
+#define THREAD_TILE_SIZE_Y 8
+#define SKEW 8
+
 #define VEC_LEN 8
 #define TILE_W_IM2COL 16
 #define NUM_THREADS_MAT_MUL 64
 
-// --- CUDA Kernel for Matrix Multiplication ---
-// This kernel remains unchanged. It operates on the data pointers it's given.
-// The logic of which GPU it runs on is handled by the host.
-__global__ void matmul_kernel(const float *A, const float *B, float *C, int M, int N, int K) {
-  int row = blockIdx.y * blockDim.y + threadIdx.y;
-  int col = blockIdx.x * blockDim.x + threadIdx.x;
+#define NUM_WARPS_X (BLOCK_TILE_SIZE_X / WARP_TILE_SIZE_X)
+#define NUM_WARPS_Y (BLOCK_TILE_SIZE_Y / WARP_TILE_SIZE_Y)
+#define NUM_THREADS_PER_BLOCK (NUM_WARPS_X * NUM_WARPS_Y * 32)
 
-  if (row < M && col < N) {
-    float C_value = 0.0f;
-    for (int k = 0; k < K; ++k) {
-      C_value += A[row * K + k] * B[k * N + col];
+__global__ void batch_matmul_kernel(
+    const float *A, const float *B, float *C,
+    int batch, int M, int N, int K) {
+    int batch_idx = blockIdx.z;
+    const float *A_batch = A + batch_idx * M * K;
+    const float *B_batch = B + batch_idx * K * N;
+    float *C_batch = C + batch_idx * M * N;
+
+    __shared__ float A_shared[2][BLOCK_TILE_SIZE_K][BLOCK_TILE_SIZE_Y + SKEW];
+    __shared__ float B_shared[2][BLOCK_TILE_SIZE_K][BLOCK_TILE_SIZE_X + SKEW];
+
+    float accum[THREAD_TILE_SIZE_Y][THREAD_TILE_SIZE_X] = {0.0f};
+
+    int tid = threadIdx.x;
+    int warp_id = tid / 32;
+    int lane_id = tid % 32;
+
+    int warp_row_idx = warp_id / NUM_WARPS_X;
+    int warp_col_idx = warp_id % NUM_WARPS_X;
+    int thread_y_in_warp = lane_id / 4;
+    int thread_x_in_warp = lane_id % 4;
+
+    int warp_start_y = warp_row_idx * WARP_TILE_SIZE_Y;
+    int warp_start_x = warp_col_idx * WARP_TILE_SIZE_X;
+    int thread_start_y_in_warp = thread_y_in_warp * THREAD_TILE_SIZE_Y;
+    int thread_start_x_in_warp = thread_x_in_warp * THREAD_TILE_SIZE_X;
+
+    int num_k_tiles = (K + BLOCK_TILE_SIZE_K - 1) / BLOCK_TILE_SIZE_K;
+
+    if (tid < 128) {
+        int tid_A = tid;
+        int thread_y = (tid_A % 32) * 4;
+        int thread_k = (tid_A / 32) * 4;
+        for (int y_offset = 0; y_offset < 4; y_offset++) {
+            int y = thread_y + y_offset;
+            int global_k = thread_k;
+            int global_y = blockIdx.y * BLOCK_TILE_SIZE_Y + y;
+            if (global_y < M && global_k < K) {
+                float4 vec = *reinterpret_cast<const float4*>(A_batch + global_y * K + global_k);
+                A_shared[0][thread_k][y] = vec.x;
+                A_shared[0][thread_k+1][y] = vec.y;
+                A_shared[0][thread_k+2][y] = vec.z;
+                A_shared[0][thread_k+3][y] = vec.w;
+            } else {
+                A_shared[0][thread_k][y] = 0.0f;
+                A_shared[0][thread_k+1][y] = 0.0f;
+                A_shared[0][thread_k+2][y] = 0.0f;
+                A_shared[0][thread_k+3][y] = 0.0f;
+            }
+        }
+    } else {
+        int tid_B = tid - 128;
+        int thread_k = (tid_B % 4) * 4;
+        int thread_x = (tid_B / 4) * 4;
+        for (int k_offset = 0; k_offset < 4; k_offset++) {
+            int k = thread_k + k_offset;
+            int global_k = k;
+            int global_x = blockIdx.x * BLOCK_TILE_SIZE_X + thread_x;
+            if (global_k < K && global_x < N) {
+                float4 vec = *reinterpret_cast<const float4*>(B_batch + global_k * N + global_x);
+                B_shared[0][k][thread_x] = vec.x;
+                B_shared[0][k][thread_x+1] = vec.y;
+                B_shared[0][k][thread_x+2] = vec.z;
+                B_shared[0][k][thread_x+3] = vec.w;
+            } else {
+                B_shared[0][k][thread_x] = 0.0f;
+                B_shared[0][k][thread_x+1] = 0.0f;
+                B_shared[0][k][thread_x+2] = 0.0f;
+                B_shared[0][k][thread_x+3] = 0.0f;
+            }
+        }
     }
-    C[row * N + col] = C_value;
+
+    __syncthreads();
+
+    int current_buffer = 0;
+    for (int k_tile = 0; k_tile < num_k_tiles; k_tile++) {
+        int next_k_tile = k_tile + 1;
+        if (next_k_tile < num_k_tiles) {
+            if (tid < 128) {
+                int tid_A = tid;
+                int thread_y = (tid_A % 32) * 4;
+                int thread_k = (tid_A / 32) * 4;
+                for (int y_offset = 0; y_offset < 4; y_offset++) {
+                    int y = thread_y + y_offset;
+                    int global_k = next_k_tile * BLOCK_TILE_SIZE_K + thread_k;
+                    int global_y = blockIdx.y * BLOCK_TILE_SIZE_Y + y;
+                    if (global_y < M && global_k < K) {
+                        float4 vec = *reinterpret_cast<const float4*>(A_batch + global_y * K + global_k);
+                        A_shared[1-current_buffer][thread_k][y] = vec.x;
+                        A_shared[1-current_buffer][thread_k+1][y] = vec.y;
+                        A_shared[1-current_buffer][thread_k+2][y] = vec.z;
+                        A_shared[1-current_buffer][thread_k+3][y] = vec.w;
+                    } else {
+                        A_shared[1-current_buffer][thread_k][y] = 0.0f;
+                        A_shared[1-current_buffer][thread_k+1][y] = 0.0f;
+                        A_shared[1-current_buffer][thread_k+2][y] = 0.0f;
+                        A_shared[1-current_buffer][thread_k+3][y] = 0.0f;
+                    }
+                }
+            } else {
+                int tid_B = tid - 128;
+                int thread_k = (tid_B % 4) * 4;
+                int thread_x = (tid_B / 4) * 4;
+                for (int k_offset = 0; k_offset < 4; k_offset++) {
+                    int k = thread_k + k_offset;
+                    int global_k = next_k_tile * BLOCK_TILE_SIZE_K + k;
+                    int global_x = blockIdx.x * BLOCK_TILE_SIZE_X + thread_x;
+                    if (global_k < K && global_x < N) {
+                        float4 vec = *reinterpret_cast<const float4*>(B_batch + global_k * N + global_x);
+                        B_shared[1-current_buffer][k][thread_x] = vec.x;
+                        B_shared[1-current_buffer][k][thread_x+1] = vec.y;
+                        B_shared[1-current_buffer][k][thread_x+2] = vec.z;
+                        B_shared[1-current_buffer][k][thread_x+3] = vec.w;
+                    } else {
+                        B_shared[1-current_buffer][k][thread_x] = 0.0f;
+                        B_shared[1-current_buffer][k][thread_x+1] = 0.0f;
+                        B_shared[1-current_buffer][k][thread_x+2] = 0.0f;
+                        B_shared[1-current_buffer][k][thread_x+3] = 0.0f;
+                    }
+                }
+            }
+        }
+
+        for (int k_inner = 0; k_inner < BLOCK_TILE_SIZE_K; k_inner++) {
+            float a_reg[THREAD_TILE_SIZE_Y];
+            float b_reg[THREAD_TILE_SIZE_X];
+
+            for (int i = 0; i < THREAD_TILE_SIZE_Y; i++) {
+                int y = warp_start_y + thread_start_y_in_warp + i;
+                a_reg[i] = A_shared[current_buffer][k_inner][y];
+            }
+
+            for (int j = 0; j < THREAD_TILE_SIZE_X; j++) {
+                int x = warp_start_x + thread_start_x_in_warp + j;
+                b_reg[j] = B_shared[current_buffer][k_inner][x];
+            }
+
+            for (int i = 0; i < THREAD_TILE_SIZE_Y; i++) {
+                for (int j = 0; j < THREAD_TILE_SIZE_X; j++) {
+                    accum[i][j] += a_reg[i] * b_reg[j];
+                }
+            }
+        }
+
+        if (next_k_tile < num_k_tiles) {
+            __syncthreads();
+        }
+        current_buffer = 1 - current_buffer;
+    }
+
+    for (int i = 0; i < THREAD_TILE_SIZE_Y; i++) {
+        for (int j = 0; j < THREAD_TILE_SIZE_X; j++) {
+            int global_y = blockIdx.y * BLOCK_TILE_SIZE_Y + warp_start_y + thread_start_y_in_warp + i;
+            int global_x = blockIdx.x * BLOCK_TILE_SIZE_X + warp_start_x + thread_start_x_in_warp + j;
+            if (global_y < M && global_x < N) {
+                C_batch[global_y * N + global_x] = accum[i][j];
+            }
+        }
+    }
+}
+
+// --- Batched Matrix Multiplication Wrapper (Multi-GPU, Combined) ---
+// This function orchestrates data movement, kernel launch, and timing 
+// for a batched matrix multiplication operation across multiple GPUs.
+void bmm_wrapper(Tensor *A, Tensor *B, Tensor *C, bool A_to_device, bool B_to_device, bool C_from_device, cudaStream_t *streams) {
+  // --- Timing variables ---
+  double func_start_time = get_time_kernel(); // CPU timer for overall wall-clock time
+  double start_time, end_time;
+  double to_device_time = 0.0;
+  double from_device_time = 0.0;
+  
+  // CUDA events are the most accurate way to time GPU execution
+  cudaEvent_t start_events[NUM_GPUS];
+  cudaEvent_t stop_events[NUM_GPUS];
+  for (int i = 0; i < NUM_GPUS; ++i) {
+      CHECK_CUDA(cudaSetDevice(i));
+      CHECK_CUDA(cudaEventCreate(&start_events[i]));
+      CHECK_CUDA(cudaEventCreate(&stop_events[i]));
   }
-}
+  // --- End of Timing variables ---
 
-// --- Host Function to Launch the Kernel ---
-// This function also remains unchanged. It simply configures and launches the kernel.
-void launch_matmul_kernel(const float *d_A, const float *d_B, float *d_C, int M, int N, int K) {
-  const int TILE_SIZE = 16;
-  dim3 blockDim(TILE_SIZE, TILE_SIZE);
-  dim3 gridDim((N + blockDim.x - 1) / blockDim.x, (M + blockDim.y - 1) / blockDim.y);
+  // 1. Time Data Movement To GPUs
+  start_time = get_time_kernel();
+  if (A_to_device) A->to_device(streams);
+  if (B_to_device) B->to_device(streams);
 
-  matmul_kernel<<<gridDim, blockDim>>>(d_A, d_B, d_C, M, N, K);
-  CHECK_CUDA(cudaGetLastError());
-}
-
-// --- Batched Matrix Multiplication Wrapper (Multi-GPU) ---
-// This function now orchestrates the operation across multiple GPUs.
-void bmm_wrapper(Tensor *A, Tensor *B, Tensor *C, cudaStream_t *streams) {
-  // 1. Move input data to the respective GPUs.
-  // to_device() handles splitting the data across all NUM_GPUS.
-  A->to_device(streams);
-  B->to_device(streams);
+  // Block CPU until all data transfers are complete to get accurate timing
+  for (int i = 0; i < NUM_GPUS; ++i) {
+      CHECK_CUDA(cudaSetDevice(i));
+      CHECK_CUDA(cudaStreamSynchronize(streams[i]));
+  }
+  end_time = get_time_kernel();
+  to_device_time = end_time - start_time;
 
   // 2. Get dimensions from tensor shapes
   const size_t batch_per_gpu = A->shape[0] / NUM_GPUS;
@@ -50,41 +221,540 @@ void bmm_wrapper(Tensor *A, Tensor *B, Tensor *C, cudaStream_t *streams) {
   const size_t K = A->shape[2];
   const size_t N = B->shape[2];
 
-  // Calculate the number of elements per single matrix in the batch
-  const size_t num_elem_A = M * K;
-  const size_t num_elem_B = K * N;
-  const size_t num_elem_C = M * N;
-
-  // 3. Loop over each GPU and launch kernels for its portion of the batch
+  // 3. Time Kernel Execution
   for (int gpu_id = 0; gpu_id < NUM_GPUS; ++gpu_id) {
-    // Set the active GPU for the following CUDA calls
-    CHECK_CUDA(cudaSetDevice(gpu_id));
+      CHECK_CUDA(cudaSetDevice(gpu_id));
+      // Record a start event in the specified stream for this GPU
+      CHECK_CUDA(cudaEventRecord(start_events[gpu_id], streams[gpu_id]));
+      
+      // --- Inlined Kernel Launch Logic ---
+      // Configure the thread block and grid dimensions for the kernel
+      dim3 blockDim(NUM_THREADS_PER_BLOCK, 1, 1);
+      dim3 gridDim(
+          (N + BLOCK_TILE_SIZE_X - 1) / BLOCK_TILE_SIZE_X,
+          (M + BLOCK_TILE_SIZE_Y - 1) / BLOCK_TILE_SIZE_Y,
+          batch_per_gpu
+      );
+      
+      // Launch the kernel on the current GPU's stream
+      batch_matmul_kernel<<<gridDim, blockDim, 0, streams[gpu_id]>>>(
+          A->d_buf[gpu_id], 
+          B->d_buf[gpu_id], 
+          C->d_buf[gpu_id], 
+          batch_per_gpu, 
+          M, N, K
+      );
+      CHECK_CUDA(cudaGetLastError());
+      // --- End of Inlined Logic ---
 
-    // Get base pointers to device memory for the current GPU
-    float *base_A_d = A->d_buf[gpu_id];
-    float *base_B_d = B->d_buf[gpu_id];
-    float *base_C_d = C->d_buf[gpu_id];
-
-    // Loop over the sub-batch assigned to this GPU
-    for (size_t b = 0; b < batch_per_gpu; ++b) {
-      // Calculate pointers for the current matrix in the sub-batch
-      float *cur_A_d = base_A_d + b * num_elem_A;
-      float *cur_B_d = base_B_d + b * num_elem_B;
-      float *cur_C_d = base_C_d + b * num_elem_C;
-
-      // Launch the kernel for the current matrices on the current GPU
-      launch_matmul_kernel(cur_A_d, cur_B_d, cur_C_d, M, N, K);
-    }
+      // Record a stop event in the specified stream for this GPU
+      CHECK_CUDA(cudaEventRecord(stop_events[gpu_id], streams[gpu_id]));
   }
   
-  // Synchronize all GPUs to ensure all computations are finished before copying back data
+  // Synchronize events and find the maximum time across all GPUs
+  float max_kernel_time_ms = 0.0f;
   for (int gpu_id = 0; gpu_id < NUM_GPUS; ++gpu_id) {
-    CHECK_CUDA(cudaSetDevice(gpu_id));
-    CHECK_CUDA(cudaDeviceSynchronize());
+      float current_gpu_time_ms = 0.0f;
+      CHECK_CUDA(cudaSetDevice(gpu_id));
+      // Wait for this GPU's stop event to complete
+      CHECK_CUDA(cudaEventSynchronize(stop_events[gpu_id]));
+      // Calculate the elapsed time between the start and stop events
+      CHECK_CUDA(cudaEventElapsedTime(&current_gpu_time_ms, start_events[gpu_id], stop_events[gpu_id]));
+      if (current_gpu_time_ms > max_kernel_time_ms) {
+          max_kernel_time_ms = current_gpu_time_ms;
+      }
   }
+  double kernel_exec_time_s = max_kernel_time_ms / 1000.0;
 
-  // 4. Copy the final result from all GPUs back to the host CPU
-  C->from_device(streams);
+  // 4. Time Data Movement From GPUs
+  start_time = get_time_kernel();
+  if (C_from_device) C->from_device(streams);
+  
+  // Block CPU until all data transfers are complete
+  for (int i = 0; i < NUM_GPUS; ++i) {
+      CHECK_CUDA(cudaSetDevice(i));
+      CHECK_CUDA(cudaStreamSynchronize(streams[i]));
+  }
+  end_time = get_time_kernel();
+  from_device_time = end_time - start_time;
+
+  // --- Cleanup ---
+  for (int i = 0; i < NUM_GPUS; ++i) {
+      CHECK_CUDA(cudaSetDevice(i));
+      CHECK_CUDA(cudaEventDestroy(start_events[i]));
+      CHECK_CUDA(cudaEventDestroy(stop_events[i]));
+  }
+  CHECK_CUDA(cudaSetDevice(0)); // Reset to default device
+
+  // --- Final Performance Report ---
+  double func_end_time = get_time_kernel();
+  double total_func_time = func_end_time - func_start_time;
+  double sum_of_parts = to_device_time + kernel_exec_time_s + from_device_time;
+  
+  printf("\n--- bmm_wrapper (Multi-GPU) Timing Report ---\n");
+  printf("Total Function Time         : %.6f s\n", total_func_time);
+  printf("--------------------------------------------\n");
+  printf("  - Data Transfer To GPUs   : %.6f s\n", to_device_time);
+  printf("  - Kernel Execution (Max)  : %.6f s\n", kernel_exec_time_s);
+  printf("  - Data Transfer From GPUs : %.6f s\n", from_device_time);
+  printf("--------------------------------------------\n");
+  printf("Sum of Timed Parts          : %.6f s\n", sum_of_parts);
+  printf("Unaccounted CPU Overhead    : %.6f s\n", total_func_time - sum_of_parts);
+  printf("--- End of Report ---\n\n");
+}
+
+/**
+ * @brief CUDA kernel to transform image patches into a column matrix (im2col).
+ * Assumes stride=1, padding=1, and kernel size 3x3, matching the CPU logic.
+ * Each thread processes one or more elements of the output column buffer.
+ */
+__global__ void im2col_kernel(const float* input_data, float* col_data,
+                            int batch_size, int C, int H, int W) {
+    // Fixed convolution parameters based on the provided CPU im2col function
+    const int R = 3, S = 3, pad = 1;
+    // For stride=1 and pad=1, output spatial dimensions match input
+    const int OH = H, OW = W;
+
+    // Total number of elements in the output column buffer for this GPU's batch
+    long long total_elements = (long long)batch_size * C * R * S * OH * OW;
+    // Grid-stride loop setup
+    long long index = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long stride = (long long)gridDim.x * blockDim.x;
+
+    for (long long i = index; i < total_elements; i += stride) {
+        // Deconstruct the flat output index `i` into multi-dimensional indices
+        long long hw_col = i % (OH * OW);
+        long long temp = i / (OH * OW);
+        long long crs_col = temp % (C * R * S);
+        long long n = temp / (C * R * S);
+
+        int w_col = hw_col % OW;
+        int h_col = hw_col / OW;
+        int s = crs_col % S;
+        int r = (crs_col / S) % R;
+        int c = crs_col / (R * S);
+
+        // Calculate corresponding coordinates in the source input tensor
+        int input_h = h_col + r - pad;
+        int input_w = w_col + s - pad;
+
+        long long dest_idx = i; // The destination index is simply the loop index
+
+        // Bounds check: if the source coordinate is outside the padded input, write zero
+        if (input_h >= 0 && input_h < H && input_w >= 0 && input_w < W) {
+            long long src_idx = (long long)n * (C * H * W) +
+                                (long long)c * (H * W) +
+                                (long long)input_h * W + input_w;
+            col_data[dest_idx] = input_data[src_idx];
+        } else {
+            col_data[dest_idx] = 0.0f;
+        }
+    }
+}
+
+/**
+ * @brief CUDA kernel to transform a column buffer back into an image (col2im).
+ * This performs a "scatter-add" operation, requiring atomic adds to prevent race conditions.
+ * Assumes a transposed convolution with stride=2 and kernel size 3x3.
+ */
+__global__ void col2im_kernel(const float* col_data, float* output_data,
+                            int batch_size, int K, int OH, int OW, int H, int W) {
+    // Fixed convolution parameters from the CPU col2im function
+    const int R = 3, S = 3, stride = 2;
+    const long long KRS = K * R * S;
+    const long long HW = H * W;
+
+    // Total elements in the source column buffer for this GPU's batch
+    long long total_elements = (long long)batch_size * KRS * HW;
+    // Grid-stride loop setup
+    long long index = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long grid_stride = (long long)gridDim.x * blockDim.x;
+
+    for (long long i = index; i < total_elements; i += grid_stride) {
+        float val = col_data[i];
+        if (val == 0.0f) continue; // Optimization: skip if value is zero
+
+        // Deconstruct the flat source index `i` from the column buffer
+        long long hw = i % HW;
+        long long temp = i / HW;
+        long long krs = temp % KRS;
+        long long n = temp / KRS;
+
+        int w = hw % W;
+        int h = hw / W;
+        int s = krs % S;
+        int r = (krs / S) % R;
+        int k = krs / (R * S);
+
+        // Calculate target coordinates in the output image (scatter)
+        const int oh = h * stride + r;
+        const int ow = w * stride + s;
+
+        // Bounds check before writing to the output tensor
+        if (oh < OH && ow < OW) {
+            long long output_idx = (long long)n * (K * OH * OW) +
+                                   (long long)k * (OH * OW) +
+                                   (long long)oh * OW + ow;
+            // Use atomicAdd to safely add the value, as multiple threads might
+            // target the same output pixel.
+            atomicAdd(&output_data[output_idx], val);
+        }
+    }
+}
+
+/**
+ * @brief CUDA kernel to transpose a 5D tensor from (N, K, C, R, S) to (N, K, R, S, C).
+ * This is a memory-bound operation where each thread re-maps one element.
+ */
+__global__ void transpose_kernel(const float* weight_data, float* transposed_data,
+                               int batch_size, int K, int C, int R, int S) {
+    // Total number of elements for this GPU's batch
+    long long total_elements = (long long)batch_size * K * C * R * S;
+
+    // Grid-stride loop over the *output* tensor's elements
+    long long index = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long stride = (long long)gridDim.x * blockDim.x;
+
+    for (long long i = index; i < total_elements; i += stride) {
+        // Deconstruct the flat destination index `i` based on the target layout (N, K, R, S, C)
+        long long temp = i;
+        int c_out = temp % C;
+        temp /= C;
+        int s_out = temp % S;
+        temp /= S;
+        int r_out = temp % R;
+        temp /= R;
+        int k_out = temp % K;
+        int n_out = temp / K;
+
+        // Calculate the corresponding source index in the original tensor (N, K, C, R, S)
+        long long src_idx = (long long)n_out * (K * C * R * S) +
+                            (long long)k_out * (C * R * S) +
+                            (long long)c_out * (R * S) +
+                            (long long)r_out * S + s_out;
+        
+        // Copy the element from source to destination
+        transposed_data[i] = weight_data[src_idx];
+    }
+}
+
+/**
+ * @brief Multi-GPU wrapper for the im2col operation.
+ * @param input The input tensor of shape (N, C, H, W).
+ * @param col_buffer The output column buffer tensor.
+ * @param input_to_device Flag to control transferring the input tensor to GPUs.
+ * @param col_buffer_from_device Flag to control transferring the result back to the CPU.
+ * @param streams Array of CUDA streams, one for each GPU.
+ */
+void im2col_wrapper(Tensor *input, Tensor *col_buffer, bool input_to_device, bool col_buffer_from_device, cudaStream_t *streams) {
+    // --- Timing variables ---
+    double func_start_time = get_time_kernel();
+    double start_time, end_time;
+    double to_device_time = 0.0;
+    double from_device_time = 0.0;
+    
+    cudaEvent_t start_events[NUM_GPUS];
+    cudaEvent_t stop_events[NUM_GPUS];
+    for (int i = 0; i < NUM_GPUS; ++i) {
+        CHECK_CUDA(cudaSetDevice(i));
+        CHECK_CUDA(cudaEventCreate(&start_events[i]));
+        CHECK_CUDA(cudaEventCreate(&stop_events[i]));
+    }
+
+    // 1. Time Data Movement To GPUs
+    start_time = get_time_kernel();
+    if (input_to_device) input->to_device(streams);
+    for (int i = 0; i < NUM_GPUS; ++i) {
+        CHECK_CUDA(cudaSetDevice(i));
+        CHECK_CUDA(cudaStreamSynchronize(streams[i]));
+    }
+    end_time = get_time_kernel();
+    to_device_time = end_time - start_time;
+
+    // 2. Get dimensions from tensor shapes
+    const size_t N = input->shape[0];
+    const size_t C = input->shape[1];
+    const size_t H = input->shape[2];
+    const size_t W = input->shape[3];
+    const size_t batch_per_gpu = N / NUM_GPUS;
+
+    // 3. Time Kernel Execution
+    for (int gpu_id = 0; gpu_id < NUM_GPUS; ++gpu_id) {
+        CHECK_CUDA(cudaSetDevice(gpu_id));
+        CHECK_CUDA(cudaEventRecord(start_events[gpu_id], streams[gpu_id]));
+        
+        long long total_elements_gpu = (long long)batch_per_gpu * C * 3 * 3 * H * W;
+        int blockSize = 256;
+        int gridSize = (total_elements_gpu + blockSize - 1) / blockSize;
+        
+        im2col_kernel<<<gridSize, blockSize, 0, streams[gpu_id]>>>(
+            input->d_buf[gpu_id], 
+            col_buffer->d_buf[gpu_id], 
+            batch_per_gpu, C, H, W
+        );
+        CHECK_CUDA(cudaGetLastError());
+        CHECK_CUDA(cudaEventRecord(stop_events[gpu_id], streams[gpu_id]));
+    }
+    
+    float max_kernel_time_ms = 0.0f;
+    for (int i = 0; i < NUM_GPUS; ++i) {
+        float current_gpu_time_ms = 0.0f;
+        CHECK_CUDA(cudaSetDevice(i));
+        CHECK_CUDA(cudaEventSynchronize(stop_events[i]));
+        CHECK_CUDA(cudaEventElapsedTime(&current_gpu_time_ms, start_events[i], stop_events[i]));
+        if (current_gpu_time_ms > max_kernel_time_ms) {
+            max_kernel_time_ms = current_gpu_time_ms;
+        }
+    }
+    double kernel_exec_time_s = max_kernel_time_ms / 1000.0;
+
+    // 4. Time Data Movement From GPUs
+    start_time = get_time_kernel();
+    if (col_buffer_from_device) col_buffer->from_device(streams);
+    for (int i = 0; i < NUM_GPUS; ++i) {
+        CHECK_CUDA(cudaSetDevice(i));
+        CHECK_CUDA(cudaStreamSynchronize(streams[i]));
+    }
+    end_time = get_time_kernel();
+    from_device_time = end_time - start_time;
+
+    // --- Cleanup & Final Performance Report ---
+    for (int i = 0; i < NUM_GPUS; ++i) {
+        CHECK_CUDA(cudaSetDevice(i));
+        CHECK_CUDA(cudaEventDestroy(start_events[i]));
+        CHECK_CUDA(cudaEventDestroy(stop_events[i]));
+    }
+    CHECK_CUDA(cudaSetDevice(0));
+
+    double total_func_time = get_time_kernel() - func_start_time;
+    double sum_of_parts = to_device_time + kernel_exec_time_s + from_device_time;
+    
+    printf("\n--- im2col_wrapper (Multi-GPU) Timing Report ---\n");
+    printf("Total Function Time         : %.6f s\n", total_func_time);
+    printf("--------------------------------------------\n");
+    printf("  - Data Transfer To GPUs   : %.6f s\n", to_device_time);
+    printf("  - Kernel Execution (Max)  : %.6f s\n", kernel_exec_time_s);
+    printf("  - Data Transfer From GPUs : %.6f s\n", from_device_time);
+    printf("--------------------------------------------\n");
+    printf("Sum of Timed Parts          : %.6f s\n", sum_of_parts);
+    printf("Unaccounted CPU Overhead    : %.6f s\n", total_func_time - sum_of_parts);
+    printf("--- End of Report ---\n\n");
+}
+
+
+/**
+ * @brief Multi-GPU wrapper for the col2im operation.
+ * @param col_buffer The input column buffer tensor.
+ * @param output The output tensor of shape (N, K, OH, OW).
+ * @param H The original input height (for index calculation).
+ * @param W The original input width (for index calculation).
+ * @param col_buffer_to_device Flag to control transferring the column buffer to GPUs.
+ * @param output_from_device Flag to control transferring the result back to the CPU.
+ * @param streams Array of CUDA streams, one for each GPU.
+ */
+void col2im_wrapper(Tensor *col_buffer, Tensor *output, int H, int W, bool col_buffer_to_device, bool output_from_device, cudaStream_t *streams) {
+    // --- Timing variables ---
+    double func_start_time = get_time_kernel();
+    double start_time, end_time;
+    double to_device_time = 0.0;
+    double from_device_time = 0.0;
+    
+    cudaEvent_t start_events[NUM_GPUS];
+    cudaEvent_t stop_events[NUM_GPUS];
+    for (int i = 0; i < NUM_GPUS; ++i) {
+        CHECK_CUDA(cudaSetDevice(i));
+        CHECK_CUDA(cudaEventCreate(&start_events[i]));
+        CHECK_CUDA(cudaEventCreate(&stop_events[i]));
+    }
+
+    // 1. Time Data Movement To GPUs
+    start_time = get_time_kernel();
+    if (col_buffer_to_device) col_buffer->to_device(streams);
+    for (int i = 0; i < NUM_GPUS; ++i) {
+        CHECK_CUDA(cudaSetDevice(i));
+        CHECK_CUDA(cudaStreamSynchronize(streams[i]));
+    }
+    end_time = get_time_kernel();
+    to_device_time = end_time - start_time;
+
+    // 2. Get dimensions from tensor shapes
+    const size_t N = output->shape[0];
+    const size_t K = output->shape[1];
+    const size_t OH = output->shape[2];
+    const size_t OW = output->shape[3];
+    const size_t batch_per_gpu = N / NUM_GPUS;
+
+    // 3. Time Kernel Execution
+    for (int gpu_id = 0; gpu_id < NUM_GPUS; ++gpu_id) {
+        CHECK_CUDA(cudaSetDevice(gpu_id));
+        
+        // IMPORTANT: Initialize output buffer on GPU to zeros before atomic additions
+        size_t output_bytes_per_gpu = batch_per_gpu * K * OH * OW * sizeof(float);
+        CHECK_CUDA(cudaMemsetAsync(output->d_buf[gpu_id], 0, output_bytes_per_gpu, streams[gpu_id]));
+
+        CHECK_CUDA(cudaEventRecord(start_events[gpu_id], streams[gpu_id]));
+        
+        long long total_elements_gpu = (long long)batch_per_gpu * K * 3 * 3 * H * W;
+        int blockSize = 256;
+        int gridSize = (total_elements_gpu + blockSize - 1) / blockSize;
+        
+        col2im_kernel<<<gridSize, blockSize, 0, streams[gpu_id]>>>(
+            col_buffer->d_buf[gpu_id],
+            output->d_buf[gpu_id],
+            batch_per_gpu, K, OH, OW, H, W
+        );
+        CHECK_CUDA(cudaGetLastError());
+        CHECK_CUDA(cudaEventRecord(stop_events[gpu_id], streams[gpu_id]));
+    }
+    
+    float max_kernel_time_ms = 0.0f;
+    for (int i = 0; i < NUM_GPUS; ++i) {
+        float current_gpu_time_ms = 0.0f;
+        CHECK_CUDA(cudaSetDevice(i));
+        CHECK_CUDA(cudaEventSynchronize(stop_events[i]));
+        CHECK_CUDA(cudaEventElapsedTime(&current_gpu_time_ms, start_events[i], stop_events[i]));
+        if (current_gpu_time_ms > max_kernel_time_ms) {
+            max_kernel_time_ms = current_gpu_time_ms;
+        }
+    }
+    double kernel_exec_time_s = max_kernel_time_ms / 1000.0;
+
+    // 4. Time Data Movement From GPUs
+    start_time = get_time_kernel();
+    if (output_from_device) output->from_device(streams);
+    for (int i = 0; i < NUM_GPUS; ++i) {
+        CHECK_CUDA(cudaSetDevice(i));
+        CHECK_CUDA(cudaStreamSynchronize(streams[i]));
+    }
+    end_time = get_time_kernel();
+    from_device_time = end_time - start_time;
+
+    // --- Cleanup & Final Performance Report ---
+    for (int i = 0; i < NUM_GPUS; ++i) {
+        CHECK_CUDA(cudaSetDevice(i));
+        CHECK_CUDA(cudaEventDestroy(start_events[i]));
+        CHECK_CUDA(cudaEventDestroy(stop_events[i]));
+    }
+    CHECK_CUDA(cudaSetDevice(0));
+
+    double total_func_time = get_time_kernel() - func_start_time;
+    double sum_of_parts = to_device_time + kernel_exec_time_s + from_device_time;
+    
+    printf("\n--- col2im_wrapper (Multi-GPU) Timing Report ---\n");
+    printf("Total Function Time         : %.6f s\n", total_func_time);
+    printf("--------------------------------------------\n");
+    printf("  - Data Transfer To GPUs   : %.6f s\n", to_device_time);
+    printf("  - Kernel Execution (Max)  : %.6f s\n", kernel_exec_time_s);
+    printf("  - Data Transfer From GPUs : %.6f s\n", from_device_time);
+    printf("--------------------------------------------\n");
+    printf("Sum of Timed Parts          : %.6f s\n", sum_of_parts);
+    printf("Unaccounted CPU Overhead    : %.6f s\n", total_func_time - sum_of_parts);
+    printf("--- End of Report ---\n\n");
+}
+
+
+/**
+ * @brief Multi-GPU wrapper for the 5D transpose operation.
+ * @param weight The input tensor with shape (N, K, C, R, S).
+ * @param weight_transpose The output tensor with shape (N, K, R, S, C).
+ * @param weight_to_device Flag to control transferring the input tensor to GPUs.
+ * @param transpose_from_device Flag to control transferring the result back to the CPU.
+ * @param streams Array of CUDA streams, one for each GPU.
+ */
+void transpose_wrapper(Tensor *weight, Tensor *weight_transpose, bool weight_to_device, bool transpose_from_device, cudaStream_t *streams) {
+    // --- Timing variables ---
+    double func_start_time = get_time_kernel();
+    double start_time, end_time;
+    double to_device_time = 0.0;
+    double from_device_time = 0.0;
+    
+    cudaEvent_t start_events[NUM_GPUS];
+    cudaEvent_t stop_events[NUM_GPUS];
+    for (int i = 0; i < NUM_GPUS; ++i) {
+        CHECK_CUDA(cudaSetDevice(i));
+        CHECK_CUDA(cudaEventCreate(&start_events[i]));
+        CHECK_CUDA(cudaEventCreate(&stop_events[i]));
+    }
+
+    // 1. Time Data Movement To GPUs
+    start_time = get_time_kernel();
+    if (weight_to_device) weight->to_device(streams);
+    for (int i = 0; i < NUM_GPUS; ++i) {
+        CHECK_CUDA(cudaSetDevice(i));
+        CHECK_CUDA(cudaStreamSynchronize(streams[i]));
+    }
+    end_time = get_time_kernel();
+    to_device_time = end_time - start_time;
+
+    // 2. Get dimensions from tensor shapes
+    const size_t N = weight->shape[0];
+    const size_t K = weight->shape[1];
+    const size_t C = weight->shape[2];
+    const size_t R = weight->shape[3];
+    const size_t S = weight->shape[4];
+    const size_t batch_per_gpu = N / NUM_GPUS;
+
+    // 3. Time Kernel Execution
+    for (int gpu_id = 0; gpu_id < NUM_GPUS; ++gpu_id) {
+        CHECK_CUDA(cudaSetDevice(gpu_id));
+        CHECK_CUDA(cudaEventRecord(start_events[gpu_id], streams[gpu_id]));
+        
+        long long total_elements_gpu = (long long)batch_per_gpu * K * C * R * S;
+        int blockSize = 256;
+        int gridSize = (total_elements_gpu + blockSize - 1) / blockSize;
+        
+        transpose_kernel<<<gridSize, blockSize, 0, streams[gpu_id]>>>(
+            weight->d_buf[gpu_id],
+            weight_transpose->d_buf[gpu_id],
+            batch_per_gpu, K, C, R, S
+        );
+        CHECK_CUDA(cudaGetLastError());
+        CHECK_CUDA(cudaEventRecord(stop_events[gpu_id], streams[gpu_id]));
+    }
+    
+    float max_kernel_time_ms = 0.0f;
+    for (int i = 0; i < NUM_GPUS; ++i) {
+        float current_gpu_time_ms = 0.0f;
+        CHECK_CUDA(cudaSetDevice(i));
+        CHECK_CUDA(cudaEventSynchronize(stop_events[i]));
+        CHECK_CUDA(cudaEventElapsedTime(&current_gpu_time_ms, start_events[i], stop_events[i]));
+        if (current_gpu_time_ms > max_kernel_time_ms) {
+            max_kernel_time_ms = current_gpu_time_ms;
+        }
+    }
+    double kernel_exec_time_s = max_kernel_time_ms / 1000.0;
+
+    // 4. Time Data Movement From GPUs
+    start_time = get_time_kernel();
+    if (transpose_from_device) weight_transpose->from_device(streams);
+    for (int i = 0; i < NUM_GPUS; ++i) {
+        CHECK_CUDA(cudaSetDevice(i));
+        CHECK_CUDA(cudaStreamSynchronize(streams[i]));
+    }
+    end_time = get_time_kernel();
+    from_device_time = end_time - start_time;
+
+    // --- Cleanup & Final Performance Report ---
+    for (int i = 0; i < NUM_GPUS; ++i) {
+        CHECK_CUDA(cudaSetDevice(i));
+        CHECK_CUDA(cudaEventDestroy(start_events[i]));
+        CHECK_CUDA(cudaEventDestroy(stop_events[i]));
+    }
+    CHECK_CUDA(cudaSetDevice(0));
+
+    double total_func_time = get_time_kernel() - func_start_time;
+    double sum_of_parts = to_device_time + kernel_exec_time_s + from_device_time;
+    
+    printf("\n--- transpose_wrapper (Multi-GPU) Timing Report ---\n");
+    printf("Total Function Time         : %.6f s\n", total_func_time);
+    printf("--------------------------------------------\n");
+    printf("  - Data Transfer To GPUs   : %.6f s\n", to_device_time);
+    printf("  - Kernel Execution (Max)  : %.6f s\n", kernel_exec_time_s);
+    printf("  - Data Transfer From GPUs : %.6f s\n", from_device_time);
+    printf("--------------------------------------------\n");
+    printf("Sum of Timed Parts          : %.6f s\n", sum_of_parts);
+    printf("Unaccounted CPU Overhead    : %.6f s\n", total_func_time - sum_of_parts);
+    printf("--- End of Report ---\n\n");
 }
 
 /**
@@ -1031,11 +1701,14 @@ void Conv2d_im2col(Tensor *input, Tensor *weight, Tensor *output, Tensor *col_bu
   // 3. ---- Call im2col to populate the provided buffer ----
   // This assumes `col_buffer` has a bmm-compatible shape of (N, OH*OW, C*R*S)
   start_time = get_time_kernel();
+  /*
   if (OH >= 64) {
     im2col_3x3_s1_p1_avx2(input, col_buffer);
   } else {
     im2col(input, col_buffer);
   }
+  */
+  im2col_wrapper(input, col_buffer, true, false, streams);
   end_time = get_time_kernel();
   im2col_time = end_time - start_time;
 
@@ -1052,7 +1725,7 @@ void Conv2d_im2col(Tensor *input, Tensor *weight, Tensor *output, Tensor *col_bu
   // Note that `col_buffer` is already in the correct format and can be used directly.
   // output_view = weight_view @ col_buffer
   start_time = get_time_kernel();
-  bmm_wrapper(weight, col_buffer, output, streams);
+  bmm_wrapper(weight, col_buffer, output, true, false, true, streams);
   end_time = get_time_kernel();
   bmm_time = end_time - start_time;
 
@@ -1120,7 +1793,7 @@ void ConvTranspose2d_col2im(Tensor *input, Tensor *weight, Tensor *output,
   weight->reshape({N, (size_t)(K * R * S), C});
   input->reshape({N, C, (size_t)(H * W)});
   start_time = get_time_kernel();
-  bmm_wrapper(weight, input, col_buffer, streams);
+  bmm_wrapper(weight, input, col_buffer, false, true, false, streams);
   end_time = get_time_kernel();
   bmm_time = end_time - start_time;
   input->reshape({N, C, H, W});
@@ -1128,7 +1801,8 @@ void ConvTranspose2d_col2im(Tensor *input, Tensor *weight, Tensor *output,
 
   // 3. col2im: Transform the columns back into the output image
   start_time = get_time_kernel();
-  col2im(col_buffer, output, H, W);
+  // col2im(col_buffer, output, H, W);
+  col2im_wrapper(col_buffer, output, H, W, false, true, streams);
   end_time = get_time_kernel();
   col2im_time = end_time - start_time;
 
@@ -1415,7 +2089,8 @@ void ModulatedConv2d(Tensor *input, Tensor *style, Tensor *modulate_weight, Tens
   if (upsample) {
     conv_path_taken = "Upsample Path";
     start_time = get_time_kernel();
-    transpose(weight_a, weight_transposed);
+    // transpose(weight_a, weight_transposed);
+    transpose_wrapper(weight_a, weight_transposed, true, false, streams);
     end_time = get_time_kernel();
     transpose_time = end_time - start_time;
     

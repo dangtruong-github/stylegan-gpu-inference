@@ -4,14 +4,6 @@
 #include <immintrin.h> // Required for AVX, FMA intrinsics
 #include "tensor.h"
 
-/* Helper functions */
-__global__ void matmul_kernel(const float *A, const float *B, float *C, int M, int N, int K);
-void launch_matmul_kernel(const float *d_A, const float *d_B, float *d_C, int M, int N, int K);
-void bmm_wrapper(Tensor *A, Tensor *B, Tensor *C);
-void im2col(Tensor* input, Tensor* col_buffer, int R, int S);
-void col2im(Tensor *col_buffer, Tensor *output, int H, int W);
-void transpose(Tensor *weight, Tensor *weight_transpose);
-
 /* Layers (Operations) */
 void PixelNorm(Tensor *inout);
 
