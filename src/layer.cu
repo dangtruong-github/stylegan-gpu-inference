@@ -20,6 +20,8 @@
 #define NUM_WARPS_Y (BLOCK_TILE_SIZE_Y / WARP_TILE_SIZE_Y)
 #define NUM_THREADS_PER_BLOCK (NUM_WARPS_X * NUM_WARPS_Y * 32)
 
+#define TILE_SIZE_LINEAR 32
+
 __global__ void batch_matmul_kernel(
     const float *A, const float *B, float *C,
     int batch, int M, int N, int K) {
@@ -285,8 +287,7 @@ void bmm_wrapper(Tensor *A, Tensor *B, Tensor *C, bool A_to_device, bool B_to_de
       CHECK_CUDA(cudaSetDevice(i));
       CHECK_CUDA(cudaEventDestroy(start_events[i]));
       CHECK_CUDA(cudaEventDestroy(stop_events[i]));
-  }
-  CHECK_CUDA(cudaSetDevice(0)); // Reset to default device
+  } // Reset to default device
 
   // --- Final Performance Report ---
   double func_end_time = get_time_kernel();
@@ -530,7 +531,6 @@ void im2col_wrapper(Tensor *input, Tensor *col_buffer, bool input_to_device, boo
       CHECK_CUDA(cudaEventDestroy(start_events[i]));
       CHECK_CUDA(cudaEventDestroy(stop_events[i]));
   }
-  CHECK_CUDA(cudaSetDevice(0));
 
   double total_func_time = get_time_kernel() - func_start_time;
   double sum_of_parts = to_device_time + kernel_exec_time_s + from_device_time;
@@ -645,7 +645,6 @@ void col2im_wrapper(Tensor *col_buffer, Tensor *output, int H, int W, bool col_b
       CHECK_CUDA(cudaEventDestroy(start_events[i]));
       CHECK_CUDA(cudaEventDestroy(stop_events[i]));
   }
-  CHECK_CUDA(cudaSetDevice(0));
 
   double total_func_time = get_time_kernel() - func_start_time;
   double sum_of_parts = to_device_time + kernel_exec_time_s + from_device_time;
@@ -754,7 +753,7 @@ void transpose_wrapper(Tensor *weight, Tensor *weight_transpose, bool weight_to_
         CHECK_CUDA(cudaEventDestroy(start_events[i]));
         CHECK_CUDA(cudaEventDestroy(stop_events[i]));
     }
-    CHECK_CUDA(cudaSetDevice(0));
+
 
     double total_func_time = get_time_kernel() - func_start_time;
     double sum_of_parts = to_device_time + kernel_exec_time_s + from_device_time;
@@ -835,35 +834,35 @@ void demodulate_wrapper(Tensor *weight_a, bool weight_to_device, bool weight_fro
   // Use OpenMP to parallelize kernel launches, assigning one CPU thread per GPU.
   #pragma omp parallel for
   for (int i = 0; i < NUM_GPUS; ++i) {
-      // Set the active GPU for the current CPU thread.
-      CHECK_CUDA(cudaSetDevice(i));
+    // Set the active GPU for the current CPU thread.
+    CHECK_CUDA(cudaSetDevice(i));
 
-      // --- Distribute Workload ---
-      // Calculate the slice of the batch this GPU is responsible for.
-      size_t start_sample = total_samples * i / NUM_GPUS;
-      size_t end_sample = total_samples * (i + 1) / NUM_GPUS;
-      size_t num_samples_for_gpu = end_sample - start_sample;
+    // --- Distribute Workload ---
+    // Calculate the slice of the batch this GPU is responsible for.
+    size_t start_sample = total_samples * i / NUM_GPUS;
+    size_t end_sample = total_samples * (i + 1) / NUM_GPUS;
+    size_t num_samples_for_gpu = end_sample - start_sample;
 
-      if (num_samples_for_gpu == 0) {
-          continue; // Skip if this GPU has no work.
-      }
+    if (num_samples_for_gpu == 0) {
+        continue; // Skip if this GPU has no work.
+    }
 
-      // --- Get Pre-assigned Data Pointer for this GPU ---
-      // This is the key change: directly use the pointer for the current device.
-      float* data_ptr_for_gpu = weight_a->d_buf[i];
-      
-      // The total number of filters this GPU will process.
-      size_t total_filters_on_gpu = num_samples_for_gpu * out_C;
-      
-      // --- Launch Kernel ---
-      const int threads_per_block = 256;
-      const int blocks_per_grid = (total_filters_on_gpu + threads_per_block - 1) / threads_per_block;
+    // --- Get Pre-assigned Data Pointer for this GPU ---
+    // This is the key change: directly use the pointer for the current device.
+    float* data_ptr_for_gpu = weight_a->d_buf[i];
+    
+    // The total number of filters this GPU will process.
+    size_t total_filters_on_gpu = num_samples_for_gpu * out_C;
+    
+    // --- Launch Kernel ---
+    const int threads_per_block = 256;
+    const int blocks_per_grid = (total_filters_on_gpu + threads_per_block - 1) / threads_per_block;
 
-      demodulate_kernel<<<blocks_per_grid, threads_per_block, 0, streams[i]>>>(
-          data_ptr_for_gpu,
-          total_filters_on_gpu,
-          weight_inner_dim
-      );
+    demodulate_kernel<<<blocks_per_grid, threads_per_block, 0, streams[i]>>>(
+        data_ptr_for_gpu,
+        total_filters_on_gpu,
+        weight_inner_dim
+    );
   }
 
   // --- Synchronize all streams across all devices ---
@@ -874,8 +873,389 @@ void demodulate_wrapper(Tensor *weight_a, bool weight_to_device, bool weight_fro
       CHECK_CUDA(cudaStreamSynchronize(streams[i]));
     }
   }
-  // Reset to the primary device.
-  CHECK_CUDA(cudaSetDevice(0));
+}
+
+__global__ void modulation_kernel(
+    float* weight_a_slice,
+    const float* conv_weight,
+    const float* style_a_slice,
+    float scale,
+    size_t total_elements_on_gpu,
+    size_t out_C,
+    size_t in_C,
+    size_t kernel_size)
+{
+    const size_t element_idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (element_idx < total_elements_on_gpu) {
+        // Decompose the element's index to find its (n, oc, ic, k) coordinates.
+        const size_t k = element_idx % kernel_size;
+        const size_t task_idx = element_idx / kernel_size;
+        const size_t n = task_idx / (out_C * in_C);
+        const size_t temp = task_idx % (out_C * in_C);
+        const size_t oc = temp / in_C;
+        const size_t ic = temp % in_C;
+
+        // Calculate the style value.
+        const float style_val = style_a_slice[n * in_C + ic] * scale;
+
+        // Find the source weight from the conv_weight tensor.
+        const size_t weight_inner_dim = in_C * kernel_size;
+        const size_t conv_weight_idx = oc * weight_inner_dim + ic * kernel_size + k;
+
+        // Compute and write the final value to the output tensor.
+        weight_a_slice[element_idx] = conv_weight[conv_weight_idx] * style_val;
+    }
+}
+
+void modulate_wrapper(
+    Tensor* conv_weight,
+    Tensor* style_a,
+    Tensor* weight_a,
+    float scale,
+    size_t out_C,
+    size_t in_C,
+    size_t R,
+    size_t S,
+    bool conv_weight_to_device,
+    bool style_a_to_device,
+    bool weight_a_from_device,
+    cudaStream_t* streams)
+{
+  if (conv_weight_to_device) conv_weight->to_device(streams);
+  if (style_a_to_device) style_a->to_device(streams);
+
+  const size_t total_samples = weight_a->shape[0];
+  const size_t kernel_size = R * S;
+  const size_t num_samples_per_gpu = total_samples / NUM_GPUS;
+
+  // Configure and launch the kernel for this GPU's data slice.
+  const size_t total_elements_on_gpu = num_samples_per_gpu * out_C * in_C * kernel_size;
+  
+  const int threads_per_block = 256;
+  const int blocks_per_grid = (total_elements_on_gpu + threads_per_block - 1) / threads_per_block;
+
+
+  #pragma omp parallel for
+  for (int i = 0; i < NUM_GPUS; ++i) {
+      CHECK_CUDA(cudaSetDevice(i));
+
+      // Get pre-distributed device pointers for the current GPU.
+      float* weight_a_ptr = weight_a->d_buf[i];
+      const float* style_a_ptr = style_a->d_buf[i];
+      const float* conv_weight_ptr = conv_weight->d_buf[i];
+
+      modulation_kernel<<<blocks_per_grid, threads_per_block, 0, streams[i]>>>(
+          weight_a_ptr, conv_weight_ptr, style_a_ptr, scale,
+          total_elements_on_gpu, out_C, in_C, kernel_size
+      );
+  }
+
+  // Synchronize all devices after launching.
+  if (weight_a_from_device) {
+    weight_a->from_device(streams);
+    for (int i = 0; i < NUM_GPUS; ++i) {
+      CHECK_CUDA(cudaSetDevice(i));
+      CHECK_CUDA(cudaStreamSynchronize(streams[i]));
+    }
+  }
+}
+
+/**
+ * @brief Corrected CUDA kernel for a high-performance tiled matrix multiplication.
+ *
+ * Computes out = (in @ w.T) * scale + b.
+ * The bug in the shared memory access pattern for the 'w' matrix tile is fixed.
+ */
+__global__ void linear_kernel(float* out, const float* in, const float* w, const float* b,
+                              size_t M, size_t N, size_t K, float scale, float lr_mul)
+{
+    // Shared memory for tiles of 'in' (As) and 'w' (Bs)
+    __shared__ float As[TILE_SIZE_LINEAR][TILE_SIZE_LINEAR];
+    __shared__ float Bs[TILE_SIZE_LINEAR][TILE_SIZE_LINEAR];
+
+    // Thread identification
+    int blockRow = blockIdx.y;
+    int blockCol = blockIdx.x;
+    int threadRow = threadIdx.y;
+    int threadCol = threadIdx.x;
+
+    // Identify the output element this thread will compute
+    int out_row = blockRow * TILE_SIZE_LINEAR + threadRow;
+    int out_col = blockCol * TILE_SIZE_LINEAR + threadCol;
+
+    // Register for accumulating the dot product
+    float sum = 0.0f;
+
+    // Loop through tiles along the K dimension
+    for (int t = 0; t < (K + TILE_SIZE_LINEAR - 1) / TILE_SIZE_LINEAR; ++t) {
+        // Cooperatively load a tile of 'in' (A) into shared memory
+        int in_k = t * TILE_SIZE_LINEAR + threadCol;
+        if (out_row < M && in_k < K) {
+            As[threadRow][threadCol] = in[out_row * K + in_k];
+        } else {
+            As[threadRow][threadCol] = 0.0f;
+        }
+
+        // Cooperatively load a tile of 'w' (B) into shared memory
+        // Note: This load performs an implicit transpose into Bs for performance.
+        int w_k = t * TILE_SIZE_LINEAR + threadRow;
+        if (out_col < N && w_k < K) {
+            Bs[threadRow][threadCol] = w[out_col * K + w_k];
+        } else {
+            Bs[threadRow][threadCol] = 0.0f;
+        }
+
+        __syncthreads(); // Wait for all threads to finish loading tiles
+
+        // --- Multiply the tiles from shared memory ---
+        // This loop performs the dot product for the current tile.
+        #pragma unroll
+        for (int k = 0; k < TILE_SIZE_LINEAR; ++k) {
+            // THE FIX IS HERE:
+            // The first index of Bs must be 'k' to match the 'k' from As.
+            // The second index must be 'threadCol' to select the correct column from the 'w' tile.
+            sum += As[threadRow][k] * Bs[k][threadCol];
+        }
+
+        __syncthreads(); // Wait for all threads to finish with the current tiles
+    }
+
+    // Write the final result to global memory
+    if (out_row < M && out_col < N) {
+        out[out_row * N + out_col] = sum * scale + b[out_col] * lr_mul;
+    }
+}
+
+/*
+ * @brief Orchestrates a Linear layer computation across multiple GPUs.
+ * The kernel launch logic is now integrated directly into this function.
+ */
+void linear_wrapper(Tensor *in, Tensor *w, Tensor *b, Tensor *out,
+                    float lr_mul, bool in_to_device, bool out_from_device, cudaStream_t *streams)
+{
+  if (in_to_device) in->to_device(streams);
+
+  const size_t M = out->shape[0];
+  const size_t N = out->shape[1];
+  const size_t K = w->shape[1];
+  const float scale = (1.0f / sqrtf(K)) * lr_mul;
+  const size_t M_for_gpu = M / NUM_GPUS;
+
+  // --- LAUNCHER LOGIC MOVED HERE --- ✨
+  // 1. Define kernel execution configuration.
+  dim3 block_dim(TILE_SIZE_LINEAR, TILE_SIZE_LINEAR, 1);
+  dim3 grid_dim((N + TILE_SIZE_LINEAR - 1) / TILE_SIZE_LINEAR, (M_for_gpu + TILE_SIZE_LINEAR - 1) / TILE_SIZE_LINEAR, 1);
+
+  #pragma omp parallel for
+  for (int i = 0; i < NUM_GPUS; ++i) {
+    CHECK_CUDA(cudaSetDevice(i));
+    
+    // --- Get pre-distributed device pointers for the current GPU ---
+    float* out_ptr = out->d_buf[i];
+    const float* in_ptr = in->d_buf[i];
+    const float* w_ptr = w->d_buf[i];
+    const float* b_ptr = b->d_buf[i];
+
+    // 2. Launch the kernel directly.
+    linear_kernel<<<grid_dim, block_dim, 0, streams[i]>>>(
+      out_ptr, in_ptr, w_ptr, b_ptr, M_for_gpu, N, K, scale, lr_mul
+    );
+    CHECK_CUDA(cudaGetLastError());
+  }
+
+  // --- Synchronize all devices ---
+  if (out_from_device) {
+    out->from_device(streams);
+    for (int i = 0; i < NUM_GPUS; ++i) {
+      CHECK_CUDA(cudaSetDevice(i));
+      CHECK_CUDA(cudaStreamSynchronize(streams[i]));
+    }
+  }
+}
+
+/**
+ * @brief Corrected fused CUDA kernel to perform addNoise+addBias+LeakyReLU.
+ *
+ * This version uses a more robust if/else structure that mirrors the
+ * "calculate both branches and select" logic from the original AVX implementation.
+ */
+__global__ void addNoiseBiasLeakyReLU_kernel(
+    float* out_slice,
+    const float* noise,
+    const float* bias,
+    size_t total_elements_on_gpu,
+    size_t C, size_t H, size_t W)
+{
+    // Hoist constants into registers
+    const float negative_slope = 0.2f;
+    const float scale = sqrtf(2.0f);
+    const float neg_slope_scaled = negative_slope * scale;
+
+    // Identify the element this thread will process
+    const size_t global_idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (global_idx < total_elements_on_gpu) {
+        // Decompose the global index to find channel and spatial indices
+        const size_t spatial_dim = H * W;
+        const size_t c = (global_idx / spatial_dim) % C;
+        const size_t spatial_idx = global_idx % spatial_dim;
+
+        // Perform the additions first
+        float val = out_slice[global_idx] + noise[spatial_idx] + bias[c];
+
+        // THE FIX IS HERE:
+        // Use an if/else structure to mirror the original's blend operation.
+        // This avoids sequential multiplications and is more robust.
+        if (val >= 0.0f) {
+            out_slice[global_idx] = val * scale;
+        } else {
+            out_slice[global_idx] = val * neg_slope_scaled;
+        }
+    }
+}
+
+/**
+ * @brief Orchestrates the fused addNoise+addBias+LeakyReLU operation across multiple GPUs.
+ *
+ * @param output The output tensor to modify in-place. Its data is distributed across GPUs.
+ * @param noise The noise tensor, assumed to be replicated on each GPU.
+ * @param conv_bias The bias tensor, assumed to be replicated on each GPU.
+ * @param NUM_GPUS The number of GPUs to use.
+ * @param streams An array of CUDA streams, one for each GPU.
+ */
+void addNoiseBiasLeakyReLU_wrapper(Tensor *output, Tensor *noise, Tensor *conv_bias, bool output_to_device, bool noise_to_device, bool conv_bias_to_device, bool output_from_device, cudaStream_t *streams)
+{
+  if (output_to_device) output->to_device(streams);
+  if (noise_to_device) noise->to_device(streams);
+  if (conv_bias_to_device) conv_bias->to_device(streams);
+  const size_t N = output->shape[0];
+  const size_t C = output->shape[1];
+  const size_t H = output->shape[2];
+  const size_t W = output->shape[3];
+
+  #pragma omp parallel for
+  for (int i = 0; i < NUM_GPUS; ++i) {
+    CHECK_CUDA(cudaSetDevice(i));
+
+    // --- Calculate workload for the current GPU ---
+    // Assumes the batch dimension N is evenly divisible by NUM_GPUS.
+    const size_t N_for_gpu = N / NUM_GPUS;
+    const size_t total_elements_on_gpu = N_for_gpu * C * H * W;
+
+    if (total_elements_on_gpu == 0) continue;
+
+    // --- Get device pointers for the current GPU ---
+    float* out_ptr = output->d_buf[i];
+    const float* noise_ptr = noise->d_buf[i];
+    const float* bias_ptr = conv_bias->d_buf[i];
+
+    // --- Configure and launch the kernel ---
+    const int block_size = 256;
+    const int grid_size = (total_elements_on_gpu + block_size - 1) / block_size;
+
+    addNoiseBiasLeakyReLU_kernel<<<grid_size, block_size, 0, streams[i]>>>(
+        out_ptr, noise_ptr, bias_ptr, total_elements_on_gpu, C, H, W
+    );
+    CHECK_CUDA(cudaGetLastError());
+  }
+
+  // --- Synchronize all devices ---
+  if (output_from_device) {
+    output->from_device(streams);
+    for (int i = 0; i < NUM_GPUS; ++i) {
+      CHECK_CUDA(cudaSetDevice(i));
+      CHECK_CUDA(cudaStreamSynchronize(streams[i]));
+    }
+  }
+}
+
+/**
+ * @brief Performs an in-place bias addition on the GPU.
+ *
+ * Each thread processes one element. It calculates the element's channel
+ * index to fetch the correct bias value, which is then added to the element.
+ *
+ * @param inout_slice Pointer to the data slice on the target GPU.
+ * @param bias Pointer to the bias vector on the same GPU.
+ * @param total_elements_on_gpu The number of elements this GPU is responsible for.
+ * @param C The total number of channels in the tensor.
+ * @param HW The spatial dimension (Height * Width).
+ */
+__global__ void addBias_kernel(
+    float* inout_slice,
+    const float* bias,
+    size_t total_elements_on_gpu,
+    size_t C,
+    size_t HW)
+{
+    // Identify the element this thread will process using its global index.
+    const size_t global_idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (global_idx < total_elements_on_gpu) {
+        // --- Calculate the channel index 'c' for the current element ---
+        // This works by dividing the element's index by the size of a
+        // single feature map (HW) and then taking the result modulo C.
+        const size_t c = (global_idx / HW) % C;
+
+        // --- Perform the in-place addition ---
+        // The same bias[c] value is broadcast across all spatial locations (H*W)
+        // for a given feature map.
+        inout_slice[global_idx] += bias[c];
+    }
+}
+
+/**
+ * @brief Orchestrates an in-place bias addition across multiple GPUs.
+ *
+ * @param inout The tensor to modify in-place. Its data is distributed across GPUs.
+ * @param bias The bias tensor, assumed to be replicated on each GPU.
+ * @param NUM_GPUS The number of GPUs to use.
+ * @param streams An array of CUDA streams, one for each GPU.
+ */
+void addBias_wrapper(Tensor *inout, Tensor *bias, bool inout_to_device, bool bias_to_device, bool inout_from_device, cudaStream_t *streams) {
+  if (inout_to_device) inout->to_device(streams);
+  if (bias_to_device) bias->to_device(streams);
+
+  const size_t N = inout->shape[0];
+  const size_t C = inout->shape[1];
+  const size_t H = inout->shape[2];
+  const size_t W = inout->shape[3];
+  const size_t HW = H * W; // Spatial dimension
+
+  #pragma omp parallel for
+  for (int i = 0; i < NUM_GPUS; ++i) {
+    CHECK_CUDA(cudaSetDevice(i));
+
+    // --- Calculate workload for the current GPU ---
+    // Assumes the batch dimension N is evenly divisible by NUM_GPUS.
+    const size_t N_for_gpu = N / NUM_GPUS;
+    const size_t total_elements_on_gpu = N_for_gpu * C * HW;
+
+    if (total_elements_on_gpu == 0) continue;
+
+    // --- Get device pointers for the current GPU ---
+    float* inout_ptr = inout->d_buf[i];
+    const float* bias_ptr = bias->d_buf[i];
+
+    // --- Configure and launch the kernel ---
+    const int block_size = 256;
+    const int grid_size = (total_elements_on_gpu + block_size - 1) / block_size;
+
+    addBias_kernel<<<grid_size, block_size, 0, streams[i]>>>(
+        inout_ptr, bias_ptr, total_elements_on_gpu, C, HW
+    );
+    CHECK_CUDA(cudaGetLastError());
+  }
+
+  // --- Synchronize all devices ---
+  if (inout_from_device) {
+    inout->from_device(streams);
+    for (int i = 0; i < NUM_GPUS; ++i) {
+      CHECK_CUDA(cudaSetDevice(i));
+      CHECK_CUDA(cudaStreamSynchronize(streams[i]));
+    }
+  }
 }
 
 // -------------- MAIN FUNCTION ---------------------
@@ -1120,7 +1500,7 @@ void UpsamplePad(Tensor *input, Tensor *output, size_t up, size_t pad0, size_t p
  * OW = (W + 2 * pad - dilation * (S - 1) - 1) / stride + 1
  * pad = 1, dilation = 1, stride = 1
  */
-void Conv2d(Tensor *input, Tensor *weight, Tensor *output, bool demodulate, cudaStream_t* streams) {
+void Conv2d(Tensor *input, Tensor *weight, Tensor *output, cudaStream_t* streams) {
   // --- Timing variables ---
   double func_start_time = get_time_kernel();
   // --- End of Timing variables ---
@@ -1132,7 +1512,7 @@ void Conv2d(Tensor *input, Tensor *weight, Tensor *output, bool demodulate, cuda
   weight->reshape({N, K, C});
   input->reshape({N, C, H*W});
   output->reshape({N, K, OH*OW});
-  bmm_wrapper(weight, input, output, !demodulate, true, true, streams);
+  bmm_wrapper(weight, input, output, false, true, true, streams);
 
   weight->reshape({N, K, C, 1, 1});
   input->reshape({N, C, H, W});
@@ -1225,6 +1605,7 @@ void Conv2d_same(Tensor *input, Tensor *weight, Tensor *output,
   double func_end_time = get_time_kernel();
   double total_time = func_end_time - func_start_time;
 
+  /*
   printf("\n--- Conv2d_same Timing Report ---\n");
   input->printShape("input");
   weight->printShape("weight");
@@ -1232,6 +1613,7 @@ void Conv2d_same(Tensor *input, Tensor *weight, Tensor *output,
   printf("N: %zu, OH: %zu, OW: %zu, stride: %d, pad: %d, dilation: %d\n", N, OH, OW, stride, pad, dilation);
   printf("Total Function Time: %.6f s\n", total_time);
   printf("--- End of Report ---\n\n");
+  */
 }
 
 /*
@@ -1244,7 +1626,7 @@ void Conv2d_same(Tensor *input, Tensor *weight, Tensor *output,
  * OW = (W + 2 * pad - dilation * (S - 1) - 1) / stride + 1
  * pad = 1, dilation = 1, stride = 1, R = S = 3
  */
-void Conv2d_im2col(Tensor *input, Tensor *weight, Tensor *output, Tensor *col_buffer, bool demodulate, cudaStream_t *streams) {
+void Conv2d_im2col(Tensor *input, Tensor *weight, Tensor *output, Tensor *col_buffer, cudaStream_t *streams) {
   // --- Timing variables ---
   double func_start_time = get_time_kernel();
   double start_time, end_time;
@@ -1285,7 +1667,7 @@ void Conv2d_im2col(Tensor *input, Tensor *weight, Tensor *output, Tensor *col_bu
   // Note that `col_buffer` is already in the correct format and can be used directly.
   // output_view = weight_view @ col_buffer
   start_time = get_time_kernel();
-  bmm_wrapper(weight, col_buffer, output, !demodulate, false, true, streams);
+  bmm_wrapper(weight, col_buffer, output, false, false, true, streams);
   end_time = get_time_kernel();
   bmm_time = end_time - start_time;
 
@@ -1298,6 +1680,7 @@ void Conv2d_im2col(Tensor *input, Tensor *weight, Tensor *output, Tensor *col_bu
   double total_func_time = func_end_time - func_start_time;
   double sum_of_parts = im2col_time + bmm_time;
 
+  /*
   printf("\n--- Conv2d_im2col Timing Report ---\n");
   input->printShape("input Conv2d_im2col");
   col_buffer->printShape("col_buffer Conv2d_im2col");
@@ -1312,6 +1695,7 @@ void Conv2d_im2col(Tensor *input, Tensor *weight, Tensor *output, Tensor *col_bu
   printf("Sum of Timed Parts  : %.6f s\n", sum_of_parts);
   printf("Unaccounted Time    : %.6f s (e.g., reshape)\n", total_func_time - sum_of_parts);
   printf("--- End of Report ---\n\n");
+  */
 }
 
 /**
@@ -1590,7 +1974,8 @@ void ModulatedConv2d(Tensor *input, Tensor *style, Tensor *modulate_weight, Tens
   size_t kernel_size = R * S;
 
   start_time = get_time_kernel();
-  Linear(style, modulate_weight, modulate_bias, style_a, 1.0f);
+  // Linear(style, modulate_weight, modulate_bias, style_a, 1.0f);
+  linear_wrapper(style, modulate_weight, modulate_bias, style_a, 1.0f, true, false, streams);
   end_time = get_time_kernel();
   linear_time = end_time - start_time;
 
@@ -1601,49 +1986,13 @@ void ModulatedConv2d(Tensor *input, Tensor *style, Tensor *modulate_weight, Tens
 
   // --- Modulation Step ---
   start_time = get_time_kernel();
-  #pragma omp parallel for collapse(3)
-  for (size_t n = 0; n < N; ++n) {
-    for (size_t oc = 0; oc < out_C; ++oc) {
-      for (size_t ic = 0; ic < in_C; ++ic) {
-        float style_val = style_a->buf[n * in_C + ic] * scale;
-        size_t conv_weight_idx = oc * weight_inner_dim + ic * kernel_size;
-        size_t weight_a_idx = n * out_C * weight_inner_dim + oc * weight_inner_dim + ic * kernel_size;
-
-        for (size_t k = 0; k < kernel_size; ++k) {
-          weight_a->buf[weight_a_idx + k] = conv_weight->buf[conv_weight_idx + k] * style_val;
-        }
-      }
-    }
-  }
+  modulate_wrapper(conv_weight, style_a, weight_a, scale, out_C, in_C, R, S, false, false, false, streams);
   end_time = get_time_kernel();
   modulation_time = end_time - start_time;
 
   if (demodulate) {
     start_time = get_time_kernel();
-    // --- Demodulation Step ---
-    /*
-    #pragma omp parallel for
-    for (size_t n = 0; n < N; ++n) {
-      size_t n_offset = n * out_C * in_C * R * S;
-      for (size_t oc = 0; oc < out_C; oc++) {
-        float sum_sq = 0.0f;
-        size_t oc_offset = oc * weight_inner_dim;
-        for (size_t ic = 0; ic < in_C; ic++) {
-          size_t ic_offset = ic * kernel_size;
-          for (size_t k = 0; k < kernel_size; k++) {
-            float w = weight_a->buf[n_offset + oc_offset + ic_offset + k];
-            sum_sq += w * w;
-          }
-        }
-        float demod_factor = rsqrtf(sum_sq + 1e-8f);
-        for (size_t i = 0; i < weight_inner_dim; ++i) {
-          weight_a->buf[n_offset + oc_offset + i] *= demod_factor;
-        }
-      }
-    }
-    */
-
-    demodulate_wrapper(weight_a, true, false, in_C, R, S, streams);
+    demodulate_wrapper(weight_a, false, false, in_C, R, S, streams);
     end_time = get_time_kernel();
     demodulation_time = end_time - start_time;
   }
@@ -1671,10 +2020,10 @@ void ModulatedConv2d(Tensor *input, Tensor *style, Tensor *modulate_weight, Tens
     // The optimized path requires K (output channels) to be a multiple of 64.
     if (weight_a->shape[1] % 64 != 0) {
       conv_path_taken = "Conv2d (Standard)";
-      Conv2d(input, weight_a, output, demodulate, streams);
+      Conv2d(input, weight_a, output, streams);
     } else {
       conv_path_taken = "Conv2d_Optimized";
-      Conv2d_im2col(input, weight_a, output, col_buffer, demodulate, streams);
+      Conv2d_im2col(input, weight_a, output, col_buffer, streams);
     }
     end_time = get_time_kernel();
     conv2d_time = end_time - start_time;
@@ -1766,71 +2115,6 @@ void addBias(Tensor *inout, Tensor *bias) {
   }
 }
 
-/**
- * @brief Combines addNoise, addBias, and LeakyReLU operations in-place using
- * a highly optimized, SIMD-accelerated implementation.
- */
-void addNoiseBiasLeakyReLU(Tensor *output, Tensor *noise, Tensor *conv_bias) {
-  // --- Timing variables ---
-  // --- 1. Hoist Pointers & Dimensions ---
-  float* const out_buf = output->buf;
-  const float* const noise_buf = noise->buf;
-  const float* const bias_buf = conv_bias->buf;
-  const size_t N = output->shape[0], C = output->shape[1], H = output->shape[2], W = output->shape[3];
-  const size_t spatial_dim = H * W;
-
-  // --- 2. Hoist & Pre-compute Constants ---
-  const float negative_slope = 0.2f;
-  const float scale = sqrtf(2.0f);
-  const float neg_slope_scaled = negative_slope * scale;
-
-  // --- 3. Prepare SIMD Constants (AVX) ---
-  const size_t vec_width = 8;
-  const __m256 v_scale = _mm256_set1_ps(scale);
-  const __m256 v_neg_slope_scaled = _mm256_set1_ps(neg_slope_scaled);
-  const __m256 v_zero = _mm256_setzero_ps();
-
-  // --- 4. Parallelize with OpenMP & Tune Schedule ---
-  #pragma omp parallel for collapse(2) schedule(static)
-  for (size_t n = 0; n < N; n++) {
-    for (size_t c = 0; c < C; c++) {
-      const float bias_val = bias_buf[c];
-      const __m256 v_bias = _mm256_set1_ps(bias_val);
-      float* out_ptr = out_buf + (n * C + c) * spatial_dim;
-      const float* noise_ptr = noise_buf;
-
-      // --- 5. Main SIMD Loop (Flattened Spatial Dimensions) ---
-      const size_t num_vectors = spatial_dim / vec_width;
-      for (size_t i = 0; i < num_vectors; ++i) {
-        __m256 v_out = _mm256_loadu_ps(out_ptr);
-        const __m256 v_noise = _mm256_loadu_ps(noise_ptr);
-        v_out = _mm256_add_ps(v_out, v_noise);
-        v_out = _mm256_add_ps(v_out, v_bias);
-        const __m256 v_pos = _mm256_mul_ps(v_out, v_scale);
-        const __m256 v_neg = _mm256_mul_ps(v_out, v_neg_slope_scaled);
-        const __m256 v_mask = _mm256_cmp_ps(v_out, v_zero, _CMP_LT_OS);
-        v_out = _mm256_blendv_ps(v_pos, v_neg, v_mask);
-        _mm256_storeu_ps(out_ptr, v_out);
-        out_ptr += vec_width;
-        noise_ptr += vec_width;
-      }
-
-      // --- 6. Scalar Remainder Loop ---
-      const size_t remainder_count = spatial_dim % vec_width;
-      for (size_t i = 0; i < remainder_count; ++i) {
-        float val = out_ptr[i];
-        val += noise_ptr[i];
-        val += bias_val;
-        if (val < 0.0f) {
-          val *= negative_slope;
-        }
-        val *= scale;
-        out_ptr[i] = val;
-      }
-    }
-  }
-}
-
 /*
  * Element-wise addition of two tensors (Optimized with AVX2)
  * @param [in & out] inout: [N, C, H, W] - Assumes buf is 32-byte aligned
@@ -1889,14 +2173,14 @@ void StyledConv(Tensor *input, Tensor *style, Tensor *modulate_weight, Tensor *m
   ModulatedConv2d(input, style, modulate_weight, modulate_bias, conv_weight, kernel, output,
                   style_a, weight_a, demod_a, col_buffer, weight_transposed, conv_a, upsample_a, conv2_a,
                   true, upsample, padding, 1, streams);
-  addNoiseBiasLeakyReLU(output, noise, conv_bias);
+  addNoiseBiasLeakyReLU_wrapper(output, noise, conv_bias, true, false, false, true, streams);
 }
 
 void ToRGB(Tensor *input, Tensor *skip, Tensor *style, Tensor *modulate_weight, Tensor *modulate_bias, Tensor *conv_weight, Tensor *conv_bias, Tensor *kernel, Tensor *output,
            Tensor *style_a, Tensor *weight_a, Tensor *col_buffer, Tensor *skip_upsample_a, Tensor *skip_conv_a, Tensor *skip_a, cudaStream_t *streams) {
   ModulatedConv2d(input, style, modulate_weight, modulate_bias, conv_weight, kernel, output,
                   style_a, weight_a, nullptr, col_buffer, nullptr, nullptr, nullptr, nullptr, false, false, 0, 2, streams);
-  addBias(output, conv_bias);
+  addBias_wrapper(output, conv_bias, true, false, true, streams);
 
   if (skip != nullptr) {
     upfir2d(skip, kernel, skip_a, skip_upsample_a, skip_conv_a, 2, 2, 1);
