@@ -6,6 +6,7 @@
 
 /* Layers (Operations) */
 void PixelNorm(Tensor *inout);
+void pixelNorm_wrapper(Tensor *inout, bool inout_to_device, bool inout_from_device, cudaStream_t *streams);
 
 void UpsamplePad(Tensor *input, Tensor *output, int up, int pad0, int pad1);
 
@@ -23,6 +24,8 @@ void Linear(Tensor *in, Tensor *w, Tensor *b, Tensor *out, float lr_mul);
 void LeakyReLU(Tensor *inout);
 
 void FusedLinearLeakyReLU(Tensor *in, Tensor *w, Tensor *b, Tensor *out, float lr_mul);
+void fusedLinearLeakyReLU_wrapper(Tensor *in, Tensor *w, Tensor *b, Tensor *out,
+                                  float lr_mul, bool in_to_device, bool out_from_device, cudaStream_t *streams);
 
 void upfir2d(Tensor *input, Tensor *kernel, Tensor *output,
                Tensor *upsample_a, Tensor *conv_a,

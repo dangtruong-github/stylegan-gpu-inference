@@ -13,7 +13,7 @@
 
 // Define the alignment boundary. 64 bytes is a good value for AVX/AVX-512.
 #define TENSOR_ALIGNMENT 64
-#define BATCH_SIZE 32
+#define BATCH_SIZE 8
 #define NUM_GPUS 4
 
 using std::vector;

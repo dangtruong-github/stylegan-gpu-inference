@@ -784,17 +784,18 @@ void generate(float *inputs, float *outputs, size_t n_samples) {
 
     /* Get latent from style through an 8-layer MLP */
     PixelNorm(input);
+    // pixelNorm_wrapper(input, true, true, streams);
 
-    FusedLinearLeakyReLU(input, mlp0_w, mlp0_b, mlp0_a, 0.01f);
-    FusedLinearLeakyReLU(mlp0_a, mlp1_w, mlp1_b, mlp1_a, 0.01f);
-    FusedLinearLeakyReLU(mlp1_a, mlp2_w, mlp2_b, mlp2_a, 0.01f);
-    FusedLinearLeakyReLU(mlp2_a, mlp3_w, mlp3_b, mlp3_a, 0.01f);
-    FusedLinearLeakyReLU(mlp3_a, mlp4_w, mlp4_b, mlp4_a, 0.01f);
-    FusedLinearLeakyReLU(mlp4_a, mlp5_w, mlp5_b, mlp5_a, 0.01f);
-    FusedLinearLeakyReLU(mlp5_a, mlp6_w, mlp6_b, mlp6_a, 0.01f);
-    FusedLinearLeakyReLU(mlp6_a, mlp7_w, mlp7_b, mlp7_a, 0.01f);
+    input->to_device(streams);
 
-    mlp7_a->to_device(streams);
+    fusedLinearLeakyReLU_wrapper(input, mlp0_w, mlp0_b, mlp0_a, 0.01f, false, false, streams);
+    fusedLinearLeakyReLU_wrapper(mlp0_a, mlp1_w, mlp1_b, mlp1_a, 0.01f, false, false, streams);
+    fusedLinearLeakyReLU_wrapper(mlp1_a, mlp2_w, mlp2_b, mlp2_a, 0.01f, false, false, streams);
+    fusedLinearLeakyReLU_wrapper(mlp2_a, mlp3_w, mlp3_b, mlp3_a, 0.01f, false, false, streams);
+    fusedLinearLeakyReLU_wrapper(mlp3_a, mlp4_w, mlp4_b, mlp4_a, 0.01f, false, false, streams);
+    fusedLinearLeakyReLU_wrapper(mlp4_a, mlp5_w, mlp5_b, mlp5_a, 0.01f, false, false, streams);
+    fusedLinearLeakyReLU_wrapper(mlp5_a, mlp6_w, mlp6_b, mlp6_a, 0.01f, false, false, streams);
+    fusedLinearLeakyReLU_wrapper(mlp6_a, mlp7_w, mlp7_b, mlp7_a, 0.01f, false, false, streams);
 
     StyledConv(constant_input, mlp7_a, conv1_modulate_w, conv1_modulate_b, conv1_w, conv1_b, kernel, conv1_noise, conv1_output_a,
                conv1_style_a, conv1_weight_a, conv1_demod_a, conv1_col_buffer, nullptr, nullptr, nullptr, nullptr, false, 1, streams);

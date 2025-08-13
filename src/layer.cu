@@ -1579,6 +1579,206 @@ void elemAdd_wrapper(Tensor *inout, Tensor *addend, bool inout_to_device, bool a
     }
   }
 }
+
+// Forward declaration of the CUDA kernel
+/**
+ * @brief Fused kernel to compute Linear + LeakyReLU with corrected bias logic.
+ */
+__global__ void fusedLinearLeakyReLU_kernel(
+    const float* __restrict__ in,
+    const float* __restrict__ w,
+    const float* __restrict__ b,
+    float* __restrict__ out,
+    size_t M, size_t N, size_t K,
+    float lr_mul, float linear_scale, float leaky_negative_slope, float leaky_scale)
+{
+  // --- Identify the output element (m, n) this thread will compute ---
+  const int m = blockIdx.y * blockDim.y + threadIdx.y;
+  const int n = blockIdx.x * blockDim.x + threadIdx.x;
+
+  // Boundary check
+  if (m < M && n < N) {
+      // --- Perform the dot product ---
+      float sum = 0.0f;
+      for (size_t k = 0; k < K; ++k) {
+          sum += in[m * K + k] * w[n * K + k];
+      }
+
+      // --- Fusion Point with corrected logic ---
+      // THE FIX IS HERE: Multiply the dot product and bias by lr_mul
+      float val = sum * linear_scale * lr_mul + b[n] * lr_mul;
+
+      if (val < 0.0f) {
+          val *= leaky_negative_slope;
+      }
+      val *= leaky_scale;
+
+      // Write the final result
+      out[m * N + n] = val;
+  }
+}
+
+/**
+ * @brief Orchestrates a Fused Linear + LeakyReLU operation across multiple GPUs.
+ *
+ * @param in Input tensor [M, K], distributed across GPUs by the M dimension.
+ * @param w Weight tensor [N, K], replicated on each GPU.
+ * @param b Bias tensor [N], replicated on each GPU.
+ * @param out Output tensor [M, N], distributed across GPUs by the M dimension.
+ * @param lr_mul Learning rate multiplier for the bias.
+ * @param NUM_GPUS The number of GPUs to use.
+ * @param streams An array of CUDA streams, one for each GPU.
+ */
+void fusedLinearLeakyReLU_wrapper(Tensor *in, Tensor *w, Tensor *b, Tensor *out,
+                                  float lr_mul, bool in_to_device, bool out_from_device, cudaStream_t *streams)
+{
+  if (in_to_device) in->to_device(streams);
+
+  const size_t M = out->shape[0];
+  const size_t N = out->shape[1];
+  const size_t K = w->shape[1];
+
+  // --- Precomputed Constants ---
+  const float linear_scale = (1.0f / sqrtf(K)); // lr_mul is handled separately now
+  const float leaky_negative_slope = 0.2f;
+  const float leaky_scale = sqrtf(2.0f);
+
+  #pragma omp parallel for
+  for (int i = 0; i < NUM_GPUS; ++i) {
+      CHECK_CUDA(cudaSetDevice(i));
+
+      // --- Calculate workload for the current GPU (more robustly) ---
+      const size_t M_start = M * i / NUM_GPUS;
+      const size_t M_end = M * (i + 1) / NUM_GPUS;
+      const size_t M_for_gpu = M_end - M_start;
+      if (M_for_gpu == 0) continue;
+
+      // --- Get device pointers for the current GPU ---
+      const float* in_ptr = in->d_buf[i];
+      const float* w_ptr = w->d_buf[i];
+      const float* b_ptr = b->d_buf[i];
+      float* out_ptr = out->d_buf[i];
+
+      // --- Configure and launch the kernel ---
+      dim3 block_dim(16, 16);
+      dim3 grid_dim((N + block_dim.x - 1) / block_dim.x,
+                    (M_for_gpu + block_dim.y - 1) / block_dim.y);
+
+      fusedLinearLeakyReLU_kernel<<<grid_dim, block_dim, 0, streams[i]>>>(
+          in_ptr, w_ptr, b_ptr, out_ptr,
+          M_for_gpu, N, K,
+          lr_mul, linear_scale, leaky_negative_slope, leaky_scale
+      );
+      CHECK_CUDA(cudaGetLastError());
+  }
+
+
+  // --- Synchronize all devices ---
+  if (out_from_device) {
+    out->from_device(streams);
+    for (int i = 0; i < NUM_GPUS; ++i) {
+      CHECK_CUDA(cudaSetDevice(i));
+      CHECK_CUDA(cudaStreamSynchronize(streams[i]));
+    }
+  }
+}
+
+/**
+ * @brief Performs in-place PixelNorm using a two-pass shared memory approach.
+ *
+ * Each thread block is responsible for normalizing one row/sample of the input tensor.
+ */
+__global__ void pixelNorm_kernel(float* __restrict__ inout_slice, size_t N_for_gpu, size_t C) {
+  // --- Shared memory for the parallel reduction ---
+  // One element per thread in the block.
+  extern __shared__ float sdata[];
+
+  // --- Thread and Block Identification ---
+  const unsigned int tid = threadIdx.x;
+  const unsigned int block_size = blockDim.x;
+  // Each block processes one sample from the batch for its GPU slice.
+  const unsigned int n = blockIdx.x;
+
+  // Pointer to the start of the row this block is responsible for.
+  float* row_ptr = inout_slice + n * C;
+
+  // --- Pass 1: Parallel Reduction to find Sum of Squares ---
+  float sum_sq = 0.0f;
+  // Each thread calculates a partial sum of squares from global memory.
+  for (unsigned int i = tid; i < C; i += block_size) {
+      float val = row_ptr[i];
+      sum_sq += val * val;
+  }
+  sdata[tid] = sum_sq;
+  __syncthreads();
+
+  // Perform the reduction in shared memory.
+  for (unsigned int s = block_size / 2; s > 0; s >>= 1) {
+      if (tid < s) {
+          sdata[tid] += sdata[tid + s];
+      }
+      __syncthreads();
+  }
+
+  // --- Calculate Normalization Factor ---
+  // The final sum is in sdata[0]. This value is the same for all threads in the block.
+  // Add a small epsilon for numerical stability.
+  float norm_factor = rsqrtf(sdata[0] / (float)C + 1e-8f);
+
+  // --- Pass 2: Apply Normalization ---
+  // The same threads now iterate back over the row to apply the factor.
+  for (unsigned int i = tid; i < C; i += block_size) {
+      row_ptr[i] *= norm_factor;
+  }
+}
+
+/**
+ * @brief Orchestrates the PixelNorm operation across multiple GPUs.
+ *
+ * @param inout The tensor to normalize in-place. Its data is distributed across GPUs.
+ * @param NUM_GPUS The number of GPUs to use.
+ * @param streams An array of CUDA streams, one for each GPU.
+ */
+void pixelNorm_wrapper(Tensor *inout, bool inout_to_device, bool inout_from_device, cudaStream_t *streams) {
+  if (inout_to_device) inout->to_device(streams);
+
+  const size_t N = inout->shape[0];
+  const size_t C = inout->shape[1];
+
+  #pragma omp parallel for
+  for (int i = 0; i < NUM_GPUS; ++i) {
+    CHECK_CUDA(cudaSetDevice(i));
+
+    // --- Calculate workload for the current GPU ---
+    const size_t N_for_gpu = N / NUM_GPUS;
+    if (N_for_gpu == 0) continue;
+
+    // --- Get device pointer for the current GPU ---
+    float* inout_ptr = inout->d_buf[i];
+
+    // --- Configure and launch the kernel ---
+    // Each thread block will process one row (one sample 'n' from the batch).
+    // The number of threads per block should be a power of 2 and <= 1024.
+    // It should be large enough to handle the channel dimension 'C'.
+    const int threads_per_block = 512; // C=512 is a good fit
+    const int blocks_per_grid = N_for_gpu; // One block per sample
+
+    pixelNorm_kernel<<<blocks_per_grid, threads_per_block, 0, streams[i]>>>(
+        inout_ptr, N_for_gpu, C
+    );
+    CHECK_CUDA(cudaGetLastError());
+  }
+
+  if (inout_from_device) {
+    inout->from_device(streams);
+    // --- Synchronize all devices ---
+    for (int i = 0; i < NUM_GPUS; ++i) {
+      CHECK_CUDA(cudaSetDevice(i));
+      CHECK_CUDA(cudaStreamSynchronize(streams[i]));
+    }
+  }
+}
+
 // -------------- MAIN FUNCTION ---------------------
 
 /**
