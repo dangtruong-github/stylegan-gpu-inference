@@ -2318,7 +2318,6 @@ void ModulatedConv2d(Tensor *input, Tensor *style, Tensor *modulate_weight, Tens
     demodulation_time = end_time - start_time;
   }
 
-  input->to_device(streams);
   if (upsample) {
     conv_path_taken = "Upsample Path";
     start_time = get_time_kernel();
@@ -2438,7 +2437,7 @@ void StyledConv(Tensor *input, Tensor *style, Tensor *modulate_weight, Tensor *m
   ModulatedConv2d(input, style, modulate_weight, modulate_bias, conv_weight, kernel, output,
                   style_a, weight_a, demod_a, col_buffer, weight_transposed, conv_a, upsample_a, conv2_a,
                   true, upsample, padding, 1, streams);
-  addNoiseBiasLeakyReLU_wrapper(output, noise, conv_bias, false, false, false, true, streams);
+  addNoiseBiasLeakyReLU_wrapper(output, noise, conv_bias, false, false, false, false, streams);
 }
 
 void ToRGB(Tensor *input, Tensor *skip, Tensor *style, Tensor *modulate_weight, Tensor *modulate_bias, Tensor *conv_weight, Tensor *conv_bias, Tensor *kernel, Tensor *output,

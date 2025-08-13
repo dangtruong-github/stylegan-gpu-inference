@@ -794,7 +794,7 @@ void generate(float *inputs, float *outputs, size_t n_samples) {
     FusedLinearLeakyReLU(mlp5_a, mlp6_w, mlp6_b, mlp6_a, 0.01f);
     FusedLinearLeakyReLU(mlp6_a, mlp7_w, mlp7_b, mlp7_a, 0.01f);
 
-    to_rgb_weight_a->to_device(streams);
+    constant_input->to_device(streams);
 
     StyledConv(constant_input, mlp7_a, conv1_modulate_w, conv1_modulate_b, conv1_w, conv1_b, kernel, conv1_noise, conv1_output_a,
                conv1_style_a, conv1_weight_a, conv1_demod_a, conv1_col_buffer, nullptr, nullptr, nullptr, nullptr, false, 1, streams);
@@ -856,6 +856,12 @@ void generate(float *inputs, float *outputs, size_t n_samples) {
                block6_conv_style_a, block6_conv_weight_a, block6_conv_demod_a, block6_conv_col_buffer, nullptr, nullptr, nullptr, nullptr, false, 1, streams);
     ToRGB(block6_conv_output_a, block5_to_rgb_output_a, mlp7_a, block6_to_rgb_modulate_w, block6_to_rgb_modulate_b, block6_to_rgb_w, block6_to_rgb_b, kernel, block6_to_rgb_output_a,
           block6_to_rgb_style_a, block6_to_rgb_weight_a, nullptr, block6_to_rgb_skip_upsample_a, block6_to_rgb_skip_conv_a, block6_skip_a, streams);
+
+    block6_to_rgb_output_a->from_device(streams);
+    for (int i = 0; i < NUM_GPUS; ++i) {
+      CHECK_CUDA(cudaSetDevice(i));
+      CHECK_CUDA(cudaStreamSynchronize(streams[i]));
+    }
 
     /* Copy the final 512x512 RGB image to the local output buffer */
     memcpy(local_outputs + BATCH_SIZE * n * 3 * 512 * 512, block6_to_rgb_output_a->buf, BATCH_SIZE * 3 * 512 * 512 * sizeof(float));
