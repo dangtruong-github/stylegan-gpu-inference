@@ -2246,9 +2246,9 @@ void FusedLinearLeakyReLU(Tensor *in, Tensor *w, Tensor *b, Tensor *out, float l
 
 void upfir2d(Tensor *input, Tensor *kernel, Tensor *output,
                Tensor *upsample_a, Tensor *conv_a,
-               size_t up, size_t pad0, size_t pad1, bool conv_transpose, cudaStream_t *streams) {
+               size_t up, size_t pad0, size_t pad1, cudaStream_t *streams) {
   // UpsamplePad(input, upsample_a, up, pad0, pad1);
-  upsample_wrapper(input, upsample_a, up, pad0, pad1, !conv_transpose, false, streams);
+  upsample_wrapper(input, upsample_a, up, pad0, pad1, false, false, streams);
 
   size_t N = upsample_a->shape[0];
   size_t C = upsample_a->shape[1];
@@ -2296,7 +2296,7 @@ void ModulatedConv2d(Tensor *input, Tensor *style, Tensor *modulate_weight, Tens
 
   start_time = get_time_kernel();
   // Linear(style, modulate_weight, modulate_bias, style_a, 1.0f);
-  linear_wrapper(style, modulate_weight, modulate_bias, style_a, 1.0f, true, false, streams);
+  linear_wrapper(style, modulate_weight, modulate_bias, style_a, 1.0f, false, false, streams);
   end_time = get_time_kernel();
   linear_time = end_time - start_time;
 
@@ -2332,7 +2332,7 @@ void ModulatedConv2d(Tensor *input, Tensor *style, Tensor *modulate_weight, Tens
     conv_transpose_time = end_time - start_time;
 
     start_time = get_time_kernel();
-    upfir2d(conv_a, kernel, output, upsample_a, conv2_a, up, 1, 1, true, streams);
+    upfir2d(conv_a, kernel, output, upsample_a, conv2_a, up, 1, 1, streams);
     end_time = get_time_kernel();
     upfir2d_time = end_time - start_time;
   }
@@ -2447,12 +2447,12 @@ void ToRGB(Tensor *input, Tensor *skip, Tensor *style, Tensor *modulate_weight, 
 
   bool output_to_device = (skip == nullptr);
     
-  addBias_wrapper(output, conv_bias, false, false, output_to_device, streams);
+  addBias_wrapper(output, conv_bias, false, false, false, streams);
 
   if (skip != nullptr) {
-    upfir2d(skip, kernel, skip_a, skip_upsample_a, skip_conv_a, 2, 2, 1, false, streams);
+    upfir2d(skip, kernel, skip_a, skip_upsample_a, skip_conv_a, 2, 2, 1, streams);
     // elemAdd(output, skip_a);
     
-    elemAdd_wrapper(output, skip_a, false, false, true, streams);
+    elemAdd_wrapper(output, skip_a, false, false, false, streams);
   }
 }

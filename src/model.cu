@@ -794,7 +794,7 @@ void generate(float *inputs, float *outputs, size_t n_samples) {
     FusedLinearLeakyReLU(mlp5_a, mlp6_w, mlp6_b, mlp6_a, 0.01f);
     FusedLinearLeakyReLU(mlp6_a, mlp7_w, mlp7_b, mlp7_a, 0.01f);
 
-    constant_input->to_device(streams);
+    mlp7_a->to_device(streams);
 
     StyledConv(constant_input, mlp7_a, conv1_modulate_w, conv1_modulate_b, conv1_w, conv1_b, kernel, conv1_noise, conv1_output_a,
                conv1_style_a, conv1_weight_a, conv1_demod_a, conv1_col_buffer, nullptr, nullptr, nullptr, nullptr, false, 1, streams);
