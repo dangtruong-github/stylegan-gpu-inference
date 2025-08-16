@@ -784,7 +784,7 @@ void generate(float *inputs, float *outputs, size_t n_samples) {
 
     /* Get latent from style through an 8-layer MLP */
     PixelNorm(input);
-    // pixelNorm_wrapper(input, true, true, streams);
+    // pixelNorm_wrapper(input, true, false, streams);
 
     input->to_device(streams);
 

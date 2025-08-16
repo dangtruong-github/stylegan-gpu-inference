@@ -1684,52 +1684,54 @@ void fusedLinearLeakyReLU_wrapper(Tensor *in, Tensor *w, Tensor *b, Tensor *out,
 }
 
 /**
- * @brief Performs in-place PixelNorm using a two-pass shared memory approach.
- *
- * Each thread block is responsible for normalizing one row/sample of the input tensor.
+ * @brief Corrected kernel for in-place PixelNorm.
  */
 __global__ void pixelNorm_kernel(float* __restrict__ inout_slice, size_t N_for_gpu, size_t C) {
-  // --- Shared memory for the parallel reduction ---
-  // One element per thread in the block.
-  extern __shared__ float sdata[];
+    // --- Shared memory for the parallel reduction ---
+    // This memory is now correctly allocated by the wrapper during launch.
+    extern __shared__ float sdata[];
 
-  // --- Thread and Block Identification ---
-  const unsigned int tid = threadIdx.x;
-  const unsigned int block_size = blockDim.x;
-  // Each block processes one sample from the batch for its GPU slice.
-  const unsigned int n = blockIdx.x;
+    // --- Thread and Block Identification ---
+    const unsigned int tid = threadIdx.x;
+    const unsigned int block_size = blockDim.x;
+    const unsigned int n = blockIdx.x; // Each block processes one sample 'n'
 
-  // Pointer to the start of the row this block is responsible for.
-  float* row_ptr = inout_slice + n * C;
+    // Pointer to the start of the row this block is responsible for.
+    float* row_ptr = inout_slice + n * C;
 
-  // --- Pass 1: Parallel Reduction to find Sum of Squares ---
-  float sum_sq = 0.0f;
-  // Each thread calculates a partial sum of squares from global memory.
-  for (unsigned int i = tid; i < C; i += block_size) {
-      float val = row_ptr[i];
-      sum_sq += val * val;
-  }
-  sdata[tid] = sum_sq;
-  __syncthreads();
+    // --- Pass 1: Parallel Reduction for Sum of Squares ---
+    float sum_sq = 0.0f;
+    for (unsigned int i = tid; i < C; i += block_size) {
+        float val = row_ptr[i];
+        sum_sq += val * val;
+    }
+    sdata[tid] = sum_sq;
+    __syncthreads();
 
-  // Perform the reduction in shared memory.
-  for (unsigned int s = block_size / 2; s > 0; s >>= 1) {
-      if (tid < s) {
-          sdata[tid] += sdata[tid + s];
-      }
-      __syncthreads();
-  }
+    // Perform the reduction in shared memory.
+    for (unsigned int s = block_size / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
 
-  // --- Calculate Normalization Factor ---
-  // The final sum is in sdata[0]. This value is the same for all threads in the block.
-  // Add a small epsilon for numerical stability.
-  float norm_factor = rsqrtf(sdata[0] / (float)C + 1e-8f);
+    // --- Calculate Normalization Factor ---
+    // Only thread 0 calculates the final factor and places it back in shared memory.
+    if (tid == 0) {
+        // Add a small epsilon for numerical stability.
+        sdata[0] = rsqrtf(sdata[0] / (float)C + 1e-8f);
+    }
+    __syncthreads(); // Ensure all threads see the final factor.
 
-  // --- Pass 2: Apply Normalization ---
-  // The same threads now iterate back over the row to apply the factor.
-  for (unsigned int i = tid; i < C; i += block_size) {
-      row_ptr[i] *= norm_factor;
-  }
+    // All threads read the final normalization factor.
+    const float norm_factor = sdata[0];
+
+    // --- Pass 2: Apply Normalization ---
+    // The same threads now iterate over the row to apply the factor.
+    for (unsigned int i = tid; i < C; i += block_size) {
+        row_ptr[i] *= norm_factor;
+    }
 }
 
 /**
@@ -1742,6 +1744,8 @@ __global__ void pixelNorm_kernel(float* __restrict__ inout_slice, size_t N_for_g
 void pixelNorm_wrapper(Tensor *inout, bool inout_to_device, bool inout_from_device, cudaStream_t *streams) {
   if (inout_to_device) inout->to_device(streams);
 
+  printf("finish putting in device\n");
+
   const size_t N = inout->shape[0];
   const size_t C = inout->shape[1];
 
@@ -1749,25 +1753,25 @@ void pixelNorm_wrapper(Tensor *inout, bool inout_to_device, bool inout_from_devi
   for (int i = 0; i < NUM_GPUS; ++i) {
     CHECK_CUDA(cudaSetDevice(i));
 
-    // --- Calculate workload for the current GPU ---
     const size_t N_for_gpu = N / NUM_GPUS;
     if (N_for_gpu == 0) continue;
 
-    // --- Get device pointer for the current GPU ---
     float* inout_ptr = inout->d_buf[i];
 
     // --- Configure and launch the kernel ---
-    // Each thread block will process one row (one sample 'n' from the batch).
-    // The number of threads per block should be a power of 2 and <= 1024.
-    // It should be large enough to handle the channel dimension 'C'.
-    const int threads_per_block = 512; // C=512 is a good fit
-    const int blocks_per_grid = N_for_gpu; // One block per sample
+    const int threads_per_block = 512;
+    const int blocks_per_grid = N_for_gpu;
 
-    pixelNorm_kernel<<<blocks_per_grid, threads_per_block, 0, streams[i]>>>(
+    // THE FIX IS HERE: Calculate and provide the dynamic shared memory size.
+    const size_t shared_mem_size = threads_per_block * sizeof(float);
+
+    pixelNorm_kernel<<<blocks_per_grid, threads_per_block, shared_mem_size, streams[i]>>>(
         inout_ptr, N_for_gpu, C
     );
     CHECK_CUDA(cudaGetLastError());
   }
+
+  printf("finish kernel\n");
 
   if (inout_from_device) {
     inout->from_device(streams);
@@ -2644,8 +2648,6 @@ void ToRGB(Tensor *input, Tensor *skip, Tensor *style, Tensor *modulate_weight, 
            Tensor *style_a, Tensor *weight_a, Tensor *col_buffer, Tensor *skip_upsample_a, Tensor *skip_conv_a, Tensor *skip_a, cudaStream_t *streams) {
   ModulatedConv2d(input, style, modulate_weight, modulate_bias, conv_weight, kernel, output,
                   style_a, weight_a, nullptr, col_buffer, nullptr, nullptr, nullptr, nullptr, false, false, 0, 2, streams);
-
-  bool output_to_device = (skip == nullptr);
     
   addBias_wrapper(output, conv_bias, false, false, false, streams);
 
