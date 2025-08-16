@@ -771,6 +771,8 @@ void generate(float *inputs, float *outputs, size_t n_samples) {
   // --- Input Data Scattering ---
   size_t batches_per_rank = n_samples / (BATCH_SIZE * mpi_size);
   size_t local_input_size = batches_per_rank * BATCH_SIZE * 512;
+  // float* local_inputs;
+  // CHECK_CUDA(cudaMallocHost(&local_inputs, local_input_size * sizeof(float)));
   float* local_inputs = new float[local_input_size];
 
   MPI_Scatter(inputs, local_input_size, MPI_FLOAT,
@@ -863,10 +865,12 @@ void generate(float *inputs, float *outputs, size_t n_samples) {
           block6_to_rgb_style_a, block6_to_rgb_weight_a, nullptr, block6_to_rgb_skip_upsample_a, block6_to_rgb_skip_conv_a, block6_skip_a, streams);
 
     block6_to_rgb_output_a->from_device(streams);
+    /*
     for (int i = 0; i < NUM_GPUS; ++i) {
       CHECK_CUDA(cudaSetDevice(i));
       CHECK_CUDA(cudaStreamSynchronize(streams[i]));
     }
+    */
 
     /* Copy the final 512x512 RGB image to the local output buffer */
     memcpy(local_outputs + BATCH_SIZE * n * 3 * 512 * 512, block6_to_rgb_output_a->buf, BATCH_SIZE * 3 * 512 * 512 * sizeof(float));
@@ -884,6 +888,7 @@ void generate(float *inputs, float *outputs, size_t n_samples) {
              MPI_COMM_WORLD);
 
   // --- Cleanup ---
+  // CHECK_CUDA(cudaFreeHost(local_inputs));
   delete[] local_inputs;
   delete[] local_outputs;
 }
