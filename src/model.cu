@@ -764,6 +764,10 @@ void generate(float *inputs, float *outputs, size_t n_samples) {
   MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
   MPI_Comm_size(MPI_COMM_WORLD, &mpi_size);
 
+  if (n_samples == 1) {
+    n_samples = BATCH_SIZE * mpi_size;
+  }
+
   // --- Input Data Scattering ---
   size_t batches_per_rank = n_samples / (BATCH_SIZE * mpi_size);
   size_t local_input_size = batches_per_rank * BATCH_SIZE * 512;
