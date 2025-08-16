@@ -1744,7 +1744,7 @@ __global__ void pixelNorm_kernel(float* __restrict__ inout_slice, size_t N_for_g
 void pixelNorm_wrapper(Tensor *inout, bool inout_to_device, bool inout_from_device, cudaStream_t *streams) {
   if (inout_to_device) inout->to_device(streams);
 
-  printf("finish putting in device\n");
+  // printf("finish putting in device\n");
 
   const size_t N = inout->shape[0];
   const size_t C = inout->shape[1];
@@ -1771,7 +1771,7 @@ void pixelNorm_wrapper(Tensor *inout, bool inout_to_device, bool inout_from_devi
     CHECK_CUDA(cudaGetLastError());
   }
 
-  printf("finish kernel\n");
+  // printf("finish kernel\n");
 
   if (inout_from_device) {
     inout->from_device(streams);

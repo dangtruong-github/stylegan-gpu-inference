@@ -795,10 +795,10 @@ void generate(float *inputs, float *outputs, size_t n_samples) {
     input_tensor->copy_buf(local_inputs + BATCH_SIZE * n * 512);
 
     /* Get latent from style through an 8-layer MLP */
-    PixelNorm(input_tensor);
-    // pixelNorm_wrapper(input, true, false, streams);
+    // PixelNorm(input_tensor);
+    pixelNorm_wrapper(input_tensor, true, false, streams);
 
-    input_tensor->to_device(streams);
+    // input_tensor->to_device(streams);
 
     fusedLinearLeakyReLU_wrapper(input_tensor, mlp0_w, mlp0_b, mlp0_a, 0.01f, false, false, streams);
     fusedLinearLeakyReLU_wrapper(mlp0_a, mlp1_w, mlp1_b, mlp1_a, 0.01f, false, false, streams);
