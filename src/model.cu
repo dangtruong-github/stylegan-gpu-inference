@@ -387,6 +387,8 @@ Activation *block0_trans_weight_transposed, *block1_trans_weight_transposed, *bl
 
 Activation *block0_trans_col_buffer, *block1_trans_col_buffer, *block2_trans_col_buffer, *block3_trans_col_buffer, *block4_trans_col_buffer, *block5_trans_col_buffer, *block6_trans_col_buffer;
 
+Tensor *input_tensor;
+
 void alloc_activations_new() {
   conv1_col_buffer = new Activation({BATCH_SIZE, 512*3*3, 4*4}, false, streams);
   block0_conv_col_buffer = new Activation({BATCH_SIZE, 512*3*3, 8*8}, false, streams);
@@ -412,6 +414,8 @@ void alloc_activations_new() {
   block4_trans_col_buffer = new Activation({BATCH_SIZE, 256*3*3, 64*64}, false, streams);
   block5_trans_col_buffer = new Activation({BATCH_SIZE, 128*3*3, 128*128}, false, streams);
   block6_trans_col_buffer = new Activation({BATCH_SIZE, 64*3*3, 256*256}, false, streams);
+
+  input_tensor = new Tensor({BATCH_SIZE, 512}, false, streams);
 
   /*
   conv1_output_a->malloc_device();
@@ -478,6 +482,8 @@ void free_activations_new() {
   for (int i = 0; i < NUM_GPUS; ++i) {
     CHECK_CUDA(cudaStreamDestroy(streams[i]));
   }
+  
+  delete input_tensor;
 
   delete conv1_col_buffer;
   delete block0_conv_col_buffer; delete block1_conv_col_buffer;
@@ -786,15 +792,15 @@ void generate(float *inputs, float *outputs, size_t n_samples) {
 
   for (size_t n = 0; n < batches_per_rank; n++) {
     /* Load a style from the local inputs */
-    Tensor *input = new Tensor({BATCH_SIZE, 512}, local_inputs + BATCH_SIZE * n * 512, false, streams);
+    input_tensor->copy_buf(local_inputs + BATCH_SIZE * n * 512);
 
     /* Get latent from style through an 8-layer MLP */
-    PixelNorm(input);
+    PixelNorm(input_tensor);
     // pixelNorm_wrapper(input, true, false, streams);
 
-    input->to_device(streams);
+    input_tensor->to_device(streams);
 
-    fusedLinearLeakyReLU_wrapper(input, mlp0_w, mlp0_b, mlp0_a, 0.01f, false, false, streams);
+    fusedLinearLeakyReLU_wrapper(input_tensor, mlp0_w, mlp0_b, mlp0_a, 0.01f, false, false, streams);
     fusedLinearLeakyReLU_wrapper(mlp0_a, mlp1_w, mlp1_b, mlp1_a, 0.01f, false, false, streams);
     fusedLinearLeakyReLU_wrapper(mlp1_a, mlp2_w, mlp2_b, mlp2_a, 0.01f, false, false, streams);
     fusedLinearLeakyReLU_wrapper(mlp2_a, mlp3_w, mlp3_b, mlp3_a, 0.01f, false, false, streams);
@@ -865,18 +871,9 @@ void generate(float *inputs, float *outputs, size_t n_samples) {
           block6_to_rgb_style_a, block6_to_rgb_weight_a, nullptr, block6_to_rgb_skip_upsample_a, block6_to_rgb_skip_conv_a, block6_skip_a, streams);
 
     block6_to_rgb_output_a->from_device(streams);
-    /*
-    for (int i = 0; i < NUM_GPUS; ++i) {
-      CHECK_CUDA(cudaSetDevice(i));
-      CHECK_CUDA(cudaStreamSynchronize(streams[i]));
-    }
-    */
 
     /* Copy the final 512x512 RGB image to the local output buffer */
     memcpy(local_outputs + BATCH_SIZE * n * 3 * 512 * 512, block6_to_rgb_output_a->buf, BATCH_SIZE * 3 * 512 * 512 * sizeof(float));
-    
-    // Clean up the Tensor created for this iteration's input
-    delete input;
   }
 
   // --- Synchronization Barrier ---

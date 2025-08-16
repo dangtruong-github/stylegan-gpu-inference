@@ -193,6 +193,15 @@ void Tensor::printShape(const std::string& descr) {
     printf("\n");
 }
 
+void Tensor::copy_buf(float *buf_) {
+    size_t N_ = num_elem();
+    size_t bytes = N_ * sizeof(float);
+    
+    if (buf && buf_) {
+        memcpy(buf, buf_, bytes);
+    }
+}
+
 /* GPU ALLOCATION AND FREE */ 
 
 // Example of replicating a tensor to all GPUs

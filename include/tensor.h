@@ -64,6 +64,8 @@ struct Tensor {
   void* aligned_alloc(size_t size);
   void aligned_free(void* ptr);
 
+  void copy_buf(float *buf_);
+
   void replicate_to_all_devices();
   void malloc_device();
   void to_device(cudaStream_t *streams);
