@@ -1663,7 +1663,6 @@ void ModulatedConv2d(Tensor *input, Tensor *style, Tensor *modulate_weight, Tens
                      Tensor *style_a, Tensor *weight_a, Tensor *demod_a, Tensor *col_buffer, Tensor *weight_transposed, Tensor *conv_a, Tensor *upsample_a, Tensor *conv2_a,
                      bool demodulate, bool upsample, size_t padding, size_t up, cudaStream_t *streams
 ) {
-  size_t N = input->shape[0];
   size_t in_C = input->shape[1];
   size_t out_C = conv_weight->shape[0];
   size_t R = conv_weight->shape[2];
