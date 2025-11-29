@@ -21,10 +21,21 @@ Experiment on a four‑node cluster, with each node equipped with 4×RTX3090 GPU
 | `StyleGAN`  | 1                                        | 112.5                 |
 | `StyleGAN`  | 4                                        | 375                   |
 
-![Performance on 1 Node](perf_1_node-gpu.png)
-![Performance on 4 Nodes](perf_4_nodes-gpu.png)
+<p align="center">
+  <table>
+    <tr>
+      <td align="center">
+        <img src="perf_1_node-gpu.png" width="400"/><br/>
+        <b>1 Node</b>
+      </td>
+      <td align="center">
+        <img src="perf_4_nodes-gpu.png" width="400"/><br/>
+        <b>4 Nodes</b>
+      </td>
+    </tr>
+  </table>
+</p>
 
----
 
 ## Acknowledgments
 
