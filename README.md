@@ -26,11 +26,11 @@ Experiment on a four‑node cluster, with each node equipped with 4×RTX3090 GPU
     <tr>
       <td align="center">
         <img src="perf_1_node-gpu.png" width="400"/><br/>
-        <b>1 Node</b>
+        <b>Performance on single node</b>
       </td>
       <td align="center">
         <img src="perf_4_nodes-gpu.png" width="400"/><br/>
-        <b>4 Nodes</b>
+        <b>Performance on 4 nodes</b>
       </td>
     </tr>
   </table>
